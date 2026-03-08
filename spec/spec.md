@@ -282,7 +282,13 @@ This configuration is loaded by the worker process normally, as if the user had 
 
 ---
 
-## 13. Non-Goals (Current Scope)
+## 13. Interface Specifications
+
+See `spec/interfaces.md` for complete interface contracts: Unix socket protocol (CLI ↔ daemon), MCP tool signatures and return types, stream-json worker protocol, hook script environment/stdin/exit codes, all state file JSON schemas, hub injection text formats, and hub/worker spawn commands.
+
+---
+
+## 14. Non-Goals (Current Scope)
 
 - Web UI or GUI
 - Multi-user / networked access
