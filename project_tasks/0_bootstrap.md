@@ -146,10 +146,15 @@ Note: workers receive the initial thread description as the first stream-json us
 
 ### Hub spawn command
 ```bash
-claude --dangerously-skip-permissions \
-  --settings '{"mcpServers":{"singleton":{"type":"http","url":"http://localhost:32100/mcp"}}}'
+claude  # no flags needed — MCP config is in .mcp.json in the hub CWD
 ```
-Spawned with `stdin=slave_pty_fd, stdout=slave_pty_fd, stderr=slave_pty_fd`.
+Spawned with `stdin=slave_pty_fd, stdout=slave_pty_fd, stderr=slave_pty_fd, cwd=~/.singleton/hub/`.
+
+**IMPORTANT**: `mcpServers` in `settings.json` is NOT supported (any scope; documented at https://code.claude.com/docs/en/settings#what-uses-scopes). MCP servers must be in `.mcp.json`. The hub CWD (`~/.singleton/hub/`) contains:
+- `.mcp.json` — MCP server config (`{"mcpServers": {"singleton": {"type": "http", "url": "..."}}}`)
+- `.claude/settings.json` — `enabledMcpjsonServers: ["singleton"]` + `permissions.allow: [...]` (enables and pre-approves singleton MCP tools)
+
+`--settings` with `mcpServers` silently does nothing in interactive mode (works only with `--print`).
 
 ### Prefix key state machine (CLI)
 ```

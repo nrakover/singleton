@@ -128,7 +128,7 @@ General acknowledgment.
 
 Transport: FastMCP HTTP/SSE on `http://localhost:32100/mcp`
 
-Hub connects at startup via `--settings '{"mcpServers":{"singleton":{"type":"http","url":"http://localhost:32100/mcp"}}}'`.
+Hub connects at startup by running from `~/.singleton/hub/` which contains `.mcp.json` with the server config. **Do not** use `--settings` for `mcpServers` — it is unsupported in `settings.json` at any scope and silently does nothing in interactive mode (see https://code.claude.com/docs/en/settings#what-uses-scopes).
 
 All tools follow MCP tool-call conventions: named arguments, JSON return values, string error messages on failure.
 
@@ -488,7 +488,7 @@ Injected at worker spawn via `--settings '<json>'`. Merges additively with any p
   "hooks": {
     "Stop": [
       {
-        "matcher": "",
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
@@ -499,7 +499,7 @@ Injected at worker spawn via `--settings '<json>'`. Merges additively with any p
     ],
     "PreToolUse": [
       {
-        "matcher": "",
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
@@ -510,7 +510,7 @@ Injected at worker spawn via `--settings '<json>'`. Merges additively with any p
     ],
     "Notification": [
       {
-        "matcher": "",
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
@@ -678,28 +678,44 @@ Approve? [a/d]:
 The daemon spawns the hub process as follows:
 
 ```python
-import os, subprocess, json
+import os, json, asyncio
+from pathlib import Path
 
 master_fd, slave_fd = os.openpty()
 
-settings = {
+hub_dir = Path.home() / ".singleton" / "hub"
+claude_dir = hub_dir / ".claude"
+claude_dir.mkdir(parents=True, exist_ok=True)
+
+singleton_tools = [
+    "create_thread", "list_threads", "get_thread", "thread_output",
+    "get_thread_events", "send_to_thread", "cancel_thread",
+    "set_thread_permissions", "list_pending_approvals",
+    "approve_tool_call", "deny_tool_call",
+]
+
+# MCP servers MUST be in .mcp.json — mcpServers is not supported in settings.json
+(hub_dir / ".mcp.json").write_text(json.dumps({
     "mcpServers": {
-        "singleton": {
-            "type": "http",
-            "url": f"http://localhost:{mcp_port}/mcp"
-        }
+        "singleton": {"type": "http", "url": f"http://127.0.0.1:{mcp_port}/mcp"}
     }
-}
+}))
+
+# .claude/settings.json — enable .mcp.json server and pre-approve singleton tools
+(claude_dir / "settings.json").write_text(json.dumps({
+    "enabledMcpjsonServers": ["singleton"],
+    "permissions": {
+        "allow": [f"mcp__singleton__{t}" for t in singleton_tools],
+    },
+}))
 
 proc = await asyncio.create_subprocess_exec(
     "claude",
-    "--dangerously-skip-permissions",
-    "--settings", json.dumps(settings),
     *(["--resume", hub_session_id] if hub_session_id else []),
     stdin=slave_fd,
     stdout=slave_fd,
     stderr=slave_fd,
-    start_new_session=True,
+    cwd=str(hub_dir),
 )
 os.close(slave_fd)
 # master_fd held by daemon; relayed to attached CLI connections

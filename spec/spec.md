@@ -25,11 +25,27 @@ The daemon is started automatically by `singleton` if not already running. It pe
 
 The hub is a standard `claude` interactive session running inside a pty owned by the daemon. It has full Claude Code TUI capabilities (markdown rendering, tool approval UI, etc.) because it runs as a real `claude` process — not a stream-json subprocess.
 
-The hub is started with:
-```bash
-claude --dangerously-skip-permissions \
-  --settings '{"mcpServers":{"singleton":{"type":"http","url":"http://localhost:32100/mcp"}}}'
-```
+The hub runs from a dedicated directory (`~/.singleton/hub/`) with two config files written by the daemon before spawn:
+
+- **`~/.singleton/hub/.mcp.json`** — MCP server configuration:
+  ```json
+  {"mcpServers": {"singleton": {"type": "http", "url": "http://127.0.0.1:32100/mcp"}}}
+  ```
+- **`~/.singleton/hub/.claude/settings.json`** — enables the MCP server and pre-approves all singleton tools:
+  ```json
+  {
+    "enabledMcpjsonServers": ["singleton"],
+    "permissions": {
+      "allow": ["mcp__singleton__create_thread", "mcp__singleton__list_threads", ...]
+    }
+  }
+  ```
+
+The hub is spawned as `claude` (no extra flags) with `cwd=~/.singleton/hub/`.
+
+> **Note**: `mcpServers` is **not** supported in `settings.json` at any scope — it must be in `.mcp.json` (see https://code.claude.com/docs/en/settings#what-uses-scopes). Passing `mcpServers` via `--settings` works only in `--print` mode and silently does nothing in interactive sessions.
+
+The `allowedTools` list grants autonomous access to exactly the 11 singleton MCP tools the hub needs to manage workers and handle approvals. All other tools (Bash, Edit, Write, etc.) remain subject to normal Claude Code permission prompts shown to the user.
 
 The hub's stdin and stdout are the master pty fd. The `singleton` CLI relays between this fd and the user's terminal.
 
@@ -209,6 +225,12 @@ For `passthrough` approvals, the daemon suspends the pty relay regardless of `hu
   daemon.sock            # unix socket: CLI ↔ daemon
   mcp.port               # daemon's MCP HTTP port (default: 32100)
   hub_session_id         # hub session ID for crash recovery
+  logs/
+    {YYYYMMDDTHHMMSS}_{pid}.daemon.log   # one log file per daemon run
+  hub/                   # hub working directory (written by daemon before spawn)
+    .mcp.json            # MCP server config for the hub session
+    .claude/
+      settings.json      # allowedTools for the hub session
   workers/
     default/             # default worker CWD; user places .claude/settings.json here
   threads/
@@ -222,6 +244,10 @@ For `passthrough` approvals, the daemon suspends the pty relay regardless of `hu
       responses/         # hub's or user's approve/deny decisions
         {req_id}.json    # {request_id, decision: "approve"|"deny", decided_at}
 ```
+
+### Daemon logs
+
+Each daemon run writes all log output to a dedicated file: `~/.singleton/logs/{YYYYMMDDTHHMMSS}_{pid}.daemon.log`. The timestamp uses local time in compact ISO-8601 format (`20260308T132731`). Log files accumulate across runs and are not automatically rotated or deleted — users may prune `~/.singleton/logs/` freely. The log path is printed to stdout when the daemon starts.
 
 ---
 
