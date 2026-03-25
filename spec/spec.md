@@ -1,8 +1,13 @@
-# singleton — Behavioral Specification
+# singleton - Behavioral Specification
 
 ## 1. Overview
 
-`singleton` is a CLI tool that provides a single, persistent hub conversation (the "hub session") through which a user manages multiple background agent threads ("worker sessions"). The user never directly creates or attaches to worker sessions; all interaction goes through the hub. The hub agent reacts autonomously to worker events without requiring user intervention, except when a `passthrough` permission request explicitly demands it.
+`singleton` is a CLI tool that provides one daemon-owned hub conversation through which a user manages multiple background worker threads. The user never directly attaches to worker sessions. The hub remains the control surface, while worker runs are durable, one-request-per-process Claude Code sessions that can outlive the daemon.
+
+The architecture is intentionally split into two planes:
+
+- an ephemeral hub plane owned by the daemon
+- a durable worker plane backed by SQLite messages and JSONL session logs
 
 ---
 
@@ -10,65 +15,73 @@
 
 ### 2.1 Daemon
 
-The `singleton` daemon is a long-running background process that acts as the central broker. It:
+The `singleton` daemon is the singleton control process. It:
 
-- Creates and owns the hub session's pseudoterminal (pty)
-- Spawns, pipes, and monitors all worker processes
-- Watches `~/.singleton/threads/*/events/` for worker-emitted events using an asyncio file watcher (`watchfiles`)
-- Injects messages into the hub's pty input when worker events occur
-- Serves the MCP HTTP server that the hub uses to interact with workers
-- Exposes a Unix socket (`~/.singleton/daemon.sock`) for the `singleton` CLI to connect to
+- owns the long-lived hub subprocess
+- serves the MCP server used by the hub
+- manages attached CLI/TUI clients
+- maintains canonical runtime UI state in memory
+- launches worker runs on demand
+- rebuilds runtime state from durable worker data after restart
 
-The daemon is started automatically by `singleton` if not already running. It persists until `singleton stop` is called.
+The daemon is started automatically by `singleton` if not already running. It persists until `singleton stop` is called or the process exits unexpectedly.
 
 ### 2.2 Hub Session
 
-The hub is a standard `claude` interactive session running inside a pty owned by the daemon. It has full Claude Code TUI capabilities (markdown rendering, tool approval UI, etc.) because it runs as a real `claude` process — not a stream-json subprocess.
+The hub is a daemon-owned long-lived `claude -p` process with streaming input and streaming output. It runs from `~/.singleton/hub/` so Claude Code discovers `.mcp.json` naturally.
 
-The hub runs from a dedicated directory (`~/.singleton/hub/`) with two config files written by the daemon before spawn:
+The daemon communicates with the hub in memory only. There is no durable queue between daemon and hub. If the daemon dies, the hub dies too.
 
-- **`~/.singleton/hub/.mcp.json`** — MCP server configuration:
-  ```json
-  {"mcpServers": {"singleton": {"type": "http", "url": "http://127.0.0.1:32100/mcp"}}}
-  ```
-- **`~/.singleton/hub/.claude/settings.json`** — enables the MCP server and pre-approves all singleton tools:
-  ```json
-  {
-    "enabledMcpjsonServers": ["singleton"],
-    "permissions": {
-      "allow": ["mcp__singleton__create_thread", "mcp__singleton__list_threads", ...]
-    }
-  }
-  ```
+The singleton TUI, not Claude's native TUI, is responsible for rendering the hub session and surrounding application state.
 
-The hub is spawned as `claude` (no extra flags) with `cwd=~/.singleton/hub/`.
+### 2.3 Worker Threads and Runs
 
-> **Note**: `mcpServers` is **not** supported in `settings.json` at any scope — it must be in `.mcp.json` (see https://code.claude.com/docs/en/settings#what-uses-scopes). Passing `mcpServers` via `--settings` works only in `--print` mode and silently does nothing in interactive sessions.
+A worker thread is a durable logical conversation. A worker run is one concrete subprocess invocation handling a single request for that thread.
 
-The `allowedTools` list grants autonomous access to exactly the 11 singleton MCP tools the hub needs to manage workers and handle approvals. All other tools (Bash, Edit, Write, etc.) remain subject to normal Claude Code permission prompts shown to the user.
+Each thread has:
+- a stable `thread_id`
+- a description and optional context
+- a working directory
+- a permissions mode: `yolo`, `supervised`, or `passthrough`
+- a nullable `session_id` used to resume subsequent runs
 
-The hub's stdin and stdout are the master pty fd. The `singleton` CLI relays between this fd and the user's terminal.
+Each run has:
+- a stable `run_id`
+- a parent `thread_id`
+- one spawned `claude -p` subprocess
+- full-fidelity stdout/stderr logs written to JSONL files
 
-The hub persists across CLI detach/re-attach cycles. Its session ID is stored in `~/.singleton/hub_session_id` so it can be resumed after a daemon restart.
+Workers are never kept alive idly between requests. Follow-up requests spawn a new process with `--resume <session_id>` when available.
 
-### 2.3 Worker Sessions
+### 2.4 SQLite Worker Plane
 
-Workers are `claude --print --input-format=stream-json --output-format=stream-json` processes. The daemon holds their stdin/stdout pipes. Workers are long-lived: their stdin is kept open (no EOF sent) so the process stays alive between turns.
+Worker-originated lifecycle facts are written into a dedicated SQLite database, `~/.singleton/messages.db`.
 
-Each worker has:
-- A thread ID (short unique identifier, e.g. `abc123`)
-- A working directory (CWD), specified at creation or defaulting to `~/.singleton/workers/default/`
-- A permissions mode: `yolo`, `supervised` (default), or `passthrough`
-- Per-thread hooks injected via `--settings` on the CLI; does not touch the project's `.claude/settings.json`
-- A system prompt appended via `--append-system-prompt` identifying it as thread `{thread_id}`
+SQLite stores:
+- thread metadata
+- run metadata
+- durable messages emitted by hooks and by daemon permission resolutions
 
-### 2.4 MCP Server
+SQLite does not store full stream logs. Raw stdout/stderr event streams are written to JSONL files.
 
-The daemon embeds an HTTP MCP server (FastMCP, HTTP/SSE transport) on `localhost:32100` (configurable). The hub connects to it at startup. MCP tools are the only way the hub interacts with workers — it never directly manages processes.
+### 2.5 Hooks
 
-### 2.5 `singleton` CLI
+Worker hooks are direct Python command hooks. They do not invoke bash wrapper scripts.
 
-The CLI is the user-facing entry point. It connects to the daemon's Unix socket and relays terminal I/O between the user and the hub's pty.
+The authoritative worker lifecycle hooks are:
+- `SessionStart`
+- `PermissionRequest`
+- `Stop`
+- `StopFailure`
+- optionally `Notification`
+
+Hooks receive `SINGLETON_THREAD_ID`, `SINGLETON_RUN_ID`, and the SQLite location in their environment.
+
+### 2.6 `singleton` CLI / TUI
+
+The CLI is the user-facing entry point. It connects to the daemon over a Unix socket. Attached clients render a singleton-owned TUI, not a raw PTY relay.
+
+Multiple clients may attach simultaneously. All see mirrored application state, but only one client owns freeform hub input at a time.
 
 ---
 
@@ -78,246 +91,199 @@ The CLI is the user-facing entry point. It connects to the daemon's Unix socket 
 
 | Command | Behavior |
 |---|---|
-| `singleton` | If daemon running: attach to hub pty. If not: start daemon + attach. |
-| `singleton attach` | Attach to existing hub pty (same as bare `singleton` when daemon is running). |
-| `singleton status` | Print thread status board to stdout without attaching. |
-| `singleton stop` | Gracefully stop daemon, hub, and all workers. |
+| `singleton` | If daemon running: attach to the singleton TUI. If not: start daemon + attach. |
+| `singleton attach` | Attach another client to the running singleton TUI. |
+| `singleton status` | Print thread and approval status without attaching. |
+| `singleton stop` | Gracefully stop daemon and hub. Running workers may continue only if not explicitly terminated by shutdown policy. |
 
-### Terminal relay
+### Prefix key
 
-When attached, the CLI operates in raw terminal mode. All bytes from the user's keyboard are forwarded to the hub pty input, and all bytes from the hub pty output are forwarded to the user's terminal — except the prefix sequence.
+The default prefix key remains `Ctrl+b`.
 
-**Prefix key**: default `Ctrl+b` (byte `\x02`). When the CLI receives the prefix byte, it enters command mode for the next keystroke:
-- `d` — detach (CLI exits, hub and daemon continue running)
-- `?` — print available prefix commands to the relay
-- Any other byte — forward both the prefix byte and the command byte as-is
+- `d` - detach this client
+- `?` - show prefix help
+- other keys - forwarded according to the active input mode
 
 ### Multi-attach
 
-Multiple `singleton attach` instances can connect simultaneously. The daemon fans hub pty output to all attached CLI connections. Input from any attached CLI is forwarded to the hub pty.
+The daemon supports multiple attached clients.
+
+- all clients receive mirrored rendered output
+- exactly one client is the active hub input owner
+- non-owning clients are read-only until they explicitly take control
+- passthrough approval prompts target the active input owner first; if none exists, the daemon may designate a temporary owner
 
 ---
 
 ## 4. Worker Lifecycle
 
-### Creation
+### Thread creation
 
-`create_thread(description, context="", cwd=None, permissions_mode="supervised")` creates a thread and spawns the worker. Returns `{thread_id}`.
+`create_thread(description, context="", cwd=None, permissions_mode="supervised")` creates a durable thread record and returns `{thread_id}`. It does not require a permanently running worker subprocess.
 
-- If `cwd` is `None`, the worker's CWD is `~/.singleton/workers/default/`
-- `~/.singleton/workers/default/` may contain a `.claude/settings.json` with default worker configuration (model, tools, system prompt additions); this is respected by the worker normally
-- Per-thread hooks are injected via `--settings <json>` at spawn time
+If `cwd` is `None`, the worker CWD defaults to `~/.singleton/workers/default/`.
 
-### Status transitions
+### Starting a run
 
-```
-pending → running → idle ↔ running
-                 → awaiting_approval → running
-                 → cancelled
-                 → done (terminal)
-```
+When the hub asks a thread to do work, the daemon:
+1. creates a `run` record first
+2. spawns a worker subprocess for that run
+3. injects hook environment including `SINGLETON_THREAD_ID` and `SINGLETON_RUN_ID`
+4. resumes with `--resume <session_id>` when the thread already has one
 
-- `running`: worker is actively processing a turn (model is generating)
-- `idle`: worker has completed a turn and is waiting for the next message
-- `awaiting_approval`: worker's `PreToolUse` hook has paused execution, waiting for approval
-- `done`: worker's process has exited (Stop hook fired, no more turns expected)
-- `cancelled`: hub called `cancel_thread`, worker was SIGTERM'd
+### Lifecycle facts
+
+Run lifecycle is derived from durable messages plus sparse metadata:
+
+- `run_started` from `SessionStart`
+- `permission_request` from `PermissionRequest`
+- `permission_resolution` from hub or user decision flow
+- `run_finished` from `Stop` or `StopFailure`
+
+Subprocess exit observation is fallback recovery for abnormal termination not covered by hooks.
 
 ### Sending a message to a worker
 
-`send_to_thread(thread_id, message)` writes a stream-json user turn to the worker's stdin pipe and blocks until the worker emits a `result` event on stdout. Returns `{result_text}` (the worker's final assistant text for that turn).
-
-After `send_to_thread` returns, the daemon also injects a summary into the hub pty (see §5).
-
-### Cancellation
-
-`cancel_thread(thread_id)` sends SIGTERM to the worker process. Worker status transitions to `cancelled`.
+`send_to_thread(thread_id, message)` creates a new run for the thread, waits for that run to finish, and returns the terminal summary extracted from the authoritative completion event.
 
 ---
 
-## 5. Worker Output → Hub (Layered Visibility)
+## 5. Worker Output and Inspection
 
-### Default injection (auto, on idle)
+### Durable logs
 
-When a worker turn completes (daemon reads a `result` event from the worker's stdout stream-json), the daemon:
-1. Extracts assistant text content from the turn's `assistant` message events (ignores `tool_use` blocks)
-2. Truncates to ≤500 characters
-3. Injects into the hub pty input as a formatted message:
+Each worker run writes full stdout/stderr stream output to JSONL log files under the thread directory. These logs are append-only and are not authored by hooks.
 
-```
-[TASK abc123 — idle] "Description here"
-Result: <truncated assistant text>
-Use thread_output("abc123") or send_to_thread("abc123", ...) for details.
-```
+### Default visibility
 
-This injection respects the hub_busy coordination (see §7).
+When a worker run finishes or requests permission, the daemon reflects that durable event into the hub/TUI state. The hub sees summarized worker outcomes rather than raw full logs by default.
 
-### On-demand inspection (hub-initiated)
+### On-demand inspection
 
-The hub can request full traces via MCP:
+The hub can inspect:
 
-- `thread_output(thread_id, page=0, page_size=50)` — returns paginated lines from `output.txt`. `page=0` = most recent `page_size` lines; incrementing `page` walks backwards. Returns `{lines, total_lines, has_more}`.
-- `get_thread_events(thread_id, page=0, page_size=10)` — returns paginated structured events (tool calls, errors, completions, approval requests). Same pagination semantics. Returns `{events, total, has_more}`.
+- recent run logs via `thread_output(...)`
+- recent durable worker events via `get_thread_events(...)`
+
+Pagination walks backward from the newest data.
 
 ---
 
 ## 6. Permissions Framework
 
-### `yolo` mode
+### `yolo`
 
-Worker spawned with `--dangerously-skip-permissions`. No hook intervention. Worker runs fully autonomously.
+Workers run with Claude-native bypass permissions. No approval hooks are expected to block execution.
 
-### `supervised` mode (default)
+### `supervised`
 
-Worker spawned without `--dangerously-skip-permissions`. A `PreToolUse` hook fires on every tool call:
+Workers run with normal Claude permissions. When Claude is about to show a permission dialog, the `PermissionRequest` hook:
 
-1. Hook writes `{request_id, thread_id, tool, input, created_at}` to `~/.singleton/threads/{id}/pending/{req_id}.json`
-2. Hook writes a signal event to `~/.singleton/threads/{id}/events/{event_id}.json`
-3. Daemon's file watcher detects the event and injects into hub pty:
-   ```
-   [TASK abc123 — awaiting approval] Bash('rm -rf /tmp/foo')
-   Call approve_tool_call("req_1") or deny_tool_call("req_1")
-   ```
-4. Hub calls `approve_tool_call(req_id)` or `deny_tool_call(req_id)` via MCP
-5. Daemon writes response to `~/.singleton/threads/{id}/responses/{req_id}.json`
-6. Hook reads response and exits `0` (allow) or `2` (block)
+1. writes a durable `permission_request` message to SQLite
+2. waits for a matching `permission_resolution`
+3. returns an allow/deny decision back to Claude, including an optional deny reason
 
-Timeout: hook polls every 1 second, up to 300 iterations (5 minutes). On timeout, exits `2` (safe default: block).
+The hub is expected to handle these requests autonomously when appropriate.
 
-### `passthrough` mode
+### `passthrough`
 
-Worker spawned without `--dangerously-skip-permissions`. `PreToolUse` hook fires:
-
-1–2. Same as supervised (write pending file + event)
-3. Daemon detects event; instead of injecting into hub, daemon temporarily suspends the pty relay and writes a direct prompt to the user's terminal:
-   ```
-   [TASK abc123] Bash('rm -rf /tmp/foo')
-   Approve? [a/d]:
-   ```
-4. User types `a` (approve) or `d` (deny); daemon writes response file and resumes pty relay
-5. Hook unblocks as in supervised
-
-`passthrough` is appropriate for high-stakes threads where the user wants direct control, bypassing hub agent judgment.
+The `PermissionRequest` hook writes the same durable request message, but the daemon routes the request to the active attached user instead of expecting the hub to decide.
 
 ### Dynamic mode change
 
-`set_thread_permissions(thread_id, mode)` changes the mode stored in `thread.json`. Takes effect on the next worker turn (hook script reads mode from `thread.json` at each invocation).
+`set_thread_permissions(thread_id, mode)` updates the durable thread metadata. The new mode applies on the next run.
 
 ---
 
-## 7. Hub Injection Coordination
-
-The daemon tracks `hub_busy` state:
-- Set to `True` when bytes appear on the hub pty output (hub is generating)
-- Set to `False` when hub pty output goes quiet for >200ms
-
-Injections are queued when `hub_busy=True`. The queue holds up to 10 pending injections. When hub becomes idle, queued injections fire in order.
-
-For `passthrough` approvals, the daemon suspends the pty relay regardless of `hub_busy` (passthrough is time-sensitive).
-
----
-
-## 8. State Layout
+## 7. State Layout
 
 ```
 ~/.singleton/
-  daemon.pid             # daemon process ID
-  daemon.sock            # unix socket: CLI ↔ daemon
-  mcp.port               # daemon's MCP HTTP port (default: 32100)
-  hub_session_id         # hub session ID for crash recovery
+  daemon.pid
+  daemon.sock
+  mcp.port
+  messages.db
   logs/
-    {YYYYMMDDTHHMMSS}_{pid}.daemon.log   # one log file per daemon run
-  hub/                   # hub working directory (written by daemon before spawn)
-    .mcp.json            # MCP server config for the hub session
+    {YYYYMMDDTHHMMSS}_{pid}.daemon.log
+  hub/
+    .mcp.json
     .claude/
-      settings.json      # allowedTools for the hub session
+      settings.json
   workers/
-    default/             # default worker CWD; user places .claude/settings.json here
+    default/
   threads/
     {thread_id}/
-      thread.json          # {id, description, context, cwd, status, permissions_mode, pid, created_at, updated_at}
-      output.txt         # all worker stdout (all turns, appended)
-      events/            # hook-written event files; daemon watches this dir
-        {event_id}.json  # {event_id, thread_id, type, data, timestamp}
-      pending/           # PreToolUse approval requests (supervised + passthrough)
-        {req_id}.json    # {request_id, thread_id, tool, input, created_at}
-      responses/         # hub's or user's approve/deny decisions
-        {req_id}.json    # {request_id, decision: "approve"|"deny", decided_at}
+      runs/
+        {run_id}.stdout.jsonl
+        {run_id}.stderr.jsonl
 ```
 
-### Daemon logs
-
-Each daemon run writes all log output to a dedicated file: `~/.singleton/logs/{YYYYMMDDTHHMMSS}_{pid}.daemon.log`. The timestamp uses local time in compact ISO-8601 format (`20260308T132731`). Log files accumulate across runs and are not automatically rotated or deleted — users may prune `~/.singleton/logs/` freely. The log path is printed to stdout when the daemon starts.
+SQLite holds durable thread/run/message records. JSONL holds full-fidelity process streams.
 
 ---
 
-## 9. Crash Recovery
+## 8. Crash Recovery
+
+If the daemon crashes:
+
+- the hub is lost and will be restarted fresh with the daemon
+- attached clients disconnect
+- worker subprocesses may continue running
+- worker hooks continue writing durable messages into SQLite
 
 On daemon restart:
-1. Reads `thread.json` for each thread; checks if `pid` is still alive via `os.kill(pid, 0)`
-2. For alive workers: attempts to re-open their stdin/stdout pipes. If re-opening is not possible (pipes are owned by the old daemon process), marks status as `disconnected`.
-3. For dead workers: marks status as `done` if last known status was `running` or `idle`; leaves `cancelled`/`done` unchanged
-4. Reads `hub_session_id` and starts a new hub with `--resume {hub_session_id}` to continue the conversation
+
+1. the daemon reads SQLite durable state
+2. rebuilds unresolved permission requests and recent run lifecycle state
+3. reconciles unfinished runs with observed subprocess state and terminal messages
+4. starts a fresh hub process
+5. rebuilds the TUI state for new attachments
 
 ---
 
-## 10. MCP Tool Reference
+## 9. MCP Tool Reference
 
 ### Thread lifecycle
 
 | Tool | Signature | Description |
 |---|---|---|
-| `create_thread` | `(description, context="", cwd=None, permissions_mode="supervised")` → `{thread_id}` | Create thread and spawn worker |
-| `list_threads` | `()` → `[{id, description, cwd, status, permissions_mode, created_at}]` | List all threads |
-| `get_thread` | `(thread_id)` → `{metadata, last_turn_summary}` | Thread metadata + last turn summary |
-| `thread_output` | `(thread_id, page=0, page_size=50)` → `{lines, total_lines, has_more}` | Paginated output; page=0=latest |
-| `get_thread_events` | `(thread_id, page=0, page_size=10)` → `{events, total, has_more}` | Paginated events; page=0=latest |
-| `send_to_thread` | `(thread_id, message)` → `{result_text}` | Send turn; blocks until complete |
-| `cancel_thread` | `(thread_id)` → `bool` | SIGTERM worker |
-| `set_thread_permissions` | `(thread_id, mode)` → `bool` | Change permission mode |
+| `create_thread` | `(description, context="", cwd=None, permissions_mode="supervised")` -> `{thread_id}` | Create durable thread metadata |
+| `list_threads` | `()` -> `[{id, description, cwd, permissions_mode, created_at, derived_status}]` | List all threads |
+| `get_thread` | `(thread_id)` -> `{metadata, last_run_summary}` | Thread metadata + latest summary |
+| `thread_output` | `(thread_id, page=0, page_size=50)` -> `{lines, total_lines, has_more}` | Paginated log output |
+| `get_thread_events` | `(thread_id, page=0, page_size=10)` -> `{events, total, has_more}` | Paginated durable lifecycle events |
+| `send_to_thread` | `(thread_id, message)` -> `{result_text, outcome}` | Start a new run and wait for completion |
+| `cancel_thread` | `(thread_id)` -> `bool` | Cancel active run if one exists |
+| `set_thread_permissions` | `(thread_id, mode)` -> `bool` | Change permission mode for future runs |
 
 ### Approval management
 
 | Tool | Signature | Description |
 |---|---|---|
-| `list_pending_approvals` | `()` → `[{request_id, thread_id, tool, input, created_at}]` | All pending approvals |
-| `approve_tool_call` | `(request_id)` → `bool` | Allow the tool call |
-| `deny_tool_call` | `(request_id)` → `bool` | Block the tool call |
+| `list_pending_approvals` | `()` -> `[{request_id, thread_id, run_id, tool, input, created_at}]` | Unresolved permission requests |
+| `approve_tool_call` | `(request_id)` -> `bool` | Allow the tool call |
+| `deny_tool_call` | `(request_id, reason="")` -> `bool` | Block the tool call with optional reason |
 
 ---
 
-## 11. Skills
+## 10. Default Worker Configuration
 
-| Skill | Trigger | Behavior |
-|---|---|---|
-| `/new-thread` | User invokes `/new-thread` | Hub gathers description, optional cwd, permissions mode (default: supervised); calls `create_thread` |
-| `/threads` | User invokes `/threads` | Hub calls `list_threads` + `list_pending_approvals`; renders status board with actionable items highlighted |
-| `/focus` | User invokes `/focus` | Hub asks for thread ID; calls `get_thread` + `thread_output(page=0)`; sets conversational context for continued work |
+`~/.singleton/workers/default/` is the default CWD for workers without an explicit `cwd`. Users may place a `.claude/settings.json` there for default worker configuration.
+
+Per-run singleton hook configuration is still injected by the daemon and must not require mutating project settings files.
 
 ---
 
-## 12. Default Worker Configuration
+## 11. Interface Specifications
 
-`~/.singleton/workers/default/` is the default CWD for workers without an explicit `cwd`. Users may place a `.claude/settings.json` in this directory to configure:
-- Default model
-- Default allowed/disallowed tools
-- System prompt additions
-- Any other Claude Code session settings
-
-This configuration is loaded by the worker process normally, as if the user had configured a project directory.
+See `spec/interfaces.md` for the concrete SQLite schema, message payloads, hook contracts, daemon/client socket protocol, worker spawn model, and TUI ownership rules.
 
 ---
 
-## 13. Interface Specifications
-
-See `spec/interfaces.md` for complete interface contracts: Unix socket protocol (CLI ↔ daemon), MCP tool signatures and return types, stream-json worker protocol, hook script environment/stdin/exit codes, all state file JSON schemas, hub injection text formats, and hub/worker spawn commands.
-
----
-
-## 14. Non-Goals (Current Scope)
+## 12. Non-Goals (Current Scope)
 
 - Web UI or GUI
 - Multi-user / networked access
-- Worker-to-worker communication (workers communicate only through the hub)
-- Automatic thread scheduling or triggers
-- Integration with specific version control systems (hub can instruct workers to use git, but singleton has no git awareness)
+- Worker-to-worker direct communication
+- Durable daemon-originated command queues
+- Support for multiple daemon instances consuming the same state directory

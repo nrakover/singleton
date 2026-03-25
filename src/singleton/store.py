@@ -1,25 +1,20 @@
-"""State management for singleton threads."""
+"""SQLite-backed durable state for singleton."""
 
-import fcntl
+from __future__ import annotations
+
 import json
 import secrets
+import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 SINGLETON_DIR: Path = Path.home() / ".singleton"
 THREADS_DIR: Path = SINGLETON_DIR / "threads"
+DB_PATH: Path = SINGLETON_DIR / "messages.db"
 
-# Per-thread file locks for append_output
-_output_locks: dict[str, threading.Lock] = {}
-_output_locks_mutex = threading.Lock()
-
-
-def _get_output_lock(thread_id: str) -> threading.Lock:
-    with _output_locks_mutex:
-        if thread_id not in _output_locks:
-            _output_locks[thread_id] = threading.Lock()
-        return _output_locks[thread_id]
+_DB_LOCK = threading.Lock()
 
 
 def _now_iso() -> str:
@@ -28,40 +23,88 @@ def _now_iso() -> str:
     return now.strftime(f"%Y-%m-%dT%H:%M:%S.{ms:03d}Z")
 
 
-def _ms_now() -> int:
-    import time
-
-    return int(time.time() * 1000)
+def _token(prefix: str) -> str:
+    return f"{prefix}_{secrets.token_hex(6)}"
 
 
 def generate_thread_id() -> str:
-    """Generate a short unique thread ID (6 hex chars)."""
     return secrets.token_hex(3)
 
 
-def generate_event_id(event_type: str) -> str:
-    """Generate event_id in format {unix_ms}-{type}-{random4}."""
-    ms = _ms_now()
-    rand = secrets.token_hex(2)
-    return f"{ms}-{event_type}-{rand}"
+def generate_run_id() -> str:
+    return _token("run")
 
 
-def generate_request_id() -> str:
-    """Generate request_id in format req_{unix_ms}_{random4}."""
-    ms = _ms_now()
-    rand = secrets.token_hex(2)
-    return f"req_{ms}_{rand}"
+def generate_message_id() -> str:
+    return _token("msg")
 
 
 def get_thread_dir(thread_id: str) -> Path:
     return THREADS_DIR / thread_id
 
 
+def get_run_dir(thread_id: str) -> Path:
+    return get_thread_dir(thread_id) / "runs"
+
+
 def init_dirs() -> None:
-    """Create ~/.singleton/ directory structure."""
     SINGLETON_DIR.mkdir(parents=True, exist_ok=True)
-    (SINGLETON_DIR / "workers" / "default").mkdir(parents=True, exist_ok=True)
     THREADS_DIR.mkdir(parents=True, exist_ok=True)
+    (SINGLETON_DIR / "workers" / "default").mkdir(parents=True, exist_ok=True)
+    _initialize_db()
+
+
+def configure_paths(state_dir: Path, db_path: Path | None = None) -> None:
+    global SINGLETON_DIR, THREADS_DIR, DB_PATH
+    SINGLETON_DIR = state_dir
+    THREADS_DIR = SINGLETON_DIR / "threads"
+    DB_PATH = db_path or (SINGLETON_DIR / "messages.db")
+
+
+def connect() -> sqlite3.Connection:
+    connection = sqlite3.connect(DB_PATH, check_same_thread=False)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA busy_timeout = 5000")
+    return connection
+
+
+def _initialize_db() -> None:
+    with _DB_LOCK, connect() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS threads (
+              thread_id TEXT PRIMARY KEY,
+              description TEXT NOT NULL,
+              context TEXT NOT NULL,
+              cwd TEXT NOT NULL,
+              permissions_mode TEXT NOT NULL,
+              session_id TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS runs (
+              run_id TEXT PRIMARY KEY,
+              thread_id TEXT NOT NULL REFERENCES threads(thread_id),
+              created_at TEXT NOT NULL,
+              pid INTEGER,
+              finished_at TEXT,
+              exit_code INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS messages (
+              message_id TEXT PRIMARY KEY,
+              direction TEXT NOT NULL,
+              message_type TEXT NOT NULL,
+              thread_id TEXT NOT NULL REFERENCES threads(thread_id),
+              run_id TEXT NOT NULL REFERENCES runs(run_id),
+              payload_json TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            """
+        )
 
 
 def create_thread(
@@ -69,245 +112,204 @@ def create_thread(
     context: str = "",
     cwd: str | None = None,
     permissions_mode: str = "supervised",
-) -> dict:
-    """Create thread.json, events/, pending/, responses/ dirs. Returns thread dict."""
+) -> dict[str, Any]:
     thread_id = generate_thread_id()
-    thread_dir = get_thread_dir(thread_id)
-    thread_dir.mkdir(parents=True, exist_ok=True)
-    (thread_dir / "events").mkdir(exist_ok=True)
-    (thread_dir / "pending").mkdir(exist_ok=True)
-    (thread_dir / "responses").mkdir(exist_ok=True)
-
     if cwd is None:
         cwd = str(SINGLETON_DIR / "workers" / "default")
-
     now = _now_iso()
-    thread = {
-        "id": thread_id,
-        "description": description,
-        "context": context,
-        "cwd": cwd,
-        "status": "pending",
-        "permissions_mode": permissions_mode,
-        "pid": None,
-        "session_id": None,
-        "created_at": now,
-        "updated_at": now,
-    }
-    _write_thread_json(thread_id, thread)
-    return thread
-
-
-def _write_thread_json(thread_id: str, data: dict) -> None:
-    thread_dir = get_thread_dir(thread_id)
-    path = thread_dir / "thread.json"
-    path.write_text(json.dumps(data, indent=2))
-
-
-def get_thread(thread_id: str) -> dict:
-    """Read thread.json. Raises FileNotFoundError if not found."""
-    path = get_thread_dir(thread_id) / "thread.json"
-    if not path.exists():
-        raise FileNotFoundError(f"Thread {thread_id} not found")
-    data = json.loads(path.read_text())
-    # Compute last_turn_summary from output.txt
-    lines = get_output_lines(thread_id)
-    if lines:
-        last_turn = "".join(lines)[-500:]
-    else:
-        last_turn = ""
-    data["last_turn_summary"] = last_turn
-    return data
-
-
-def list_threads() -> list[dict]:
-    """List all threads sorted by created_at descending."""
-    threads = []
-    if not THREADS_DIR.exists():
-        return threads
-    for thread_dir in THREADS_DIR.iterdir():
-        if thread_dir.is_dir():
-            try:
-                t = get_thread(thread_dir.name)
-                threads.append(t)
-            except (FileNotFoundError, json.JSONDecodeError):
-                continue
-    threads.sort(key=lambda t: t["created_at"], reverse=True)
-    return threads
-
-
-def update_thread(thread_id: str, **kwargs) -> dict:
-    """Update thread.json fields. Always updates updated_at."""
-    thread = get_thread(thread_id)
-    # Remove computed field before writing
-    thread.pop("last_turn_summary", None)
-    thread.update(kwargs)
-    thread["updated_at"] = _now_iso()
-    _write_thread_json(thread_id, thread)
+    get_run_dir(thread_id).mkdir(parents=True, exist_ok=True)
+    with _DB_LOCK, connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO threads (
+                thread_id, description, context, cwd, permissions_mode, session_id,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (thread_id, description, context, cwd, permissions_mode, None, now, now),
+        )
     return get_thread(thread_id)
 
 
-def update_thread_status(thread_id: str, status: str) -> dict:
-    """Convenience: update status field."""
-    return update_thread(thread_id, status=status)
+def list_threads() -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute("SELECT * FROM threads ORDER BY created_at DESC").fetchall()
+    return [_row_to_dict(row) for row in rows]
 
 
-def append_output(thread_id: str, text: str) -> None:
-    """Append text to output.txt (thread-safe)."""
-    path = get_thread_dir(thread_id) / "output.txt"
-    lock = _get_output_lock(thread_id)
-    with lock:
-        with open(path, "a") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            try:
-                f.write(text)
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
+def get_thread(thread_id: str) -> dict[str, Any]:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM threads WHERE thread_id = ?", (thread_id,)
+        ).fetchone()
+    if row is None:
+        raise FileNotFoundError(f"thread not found: {thread_id}")
+    return _row_to_dict(row)
 
 
-def get_output_lines(thread_id: str) -> list[str]:
-    """Read all lines from output.txt. Returns [] if file doesn't exist."""
-    path = get_thread_dir(thread_id) / "output.txt"
-    if not path.exists():
-        return []
-    return path.read_text().splitlines(keepends=True)
+def update_thread(thread_id: str, **kwargs: Any) -> dict[str, Any]:
+    if not kwargs:
+        return get_thread(thread_id)
+    allowed = {"description", "context", "cwd", "permissions_mode", "session_id"}
+    unknown = set(kwargs) - allowed
+    if unknown:
+        raise ValueError(f"unknown thread fields: {sorted(unknown)}")
+    fields = list(kwargs)
+    assignments = ", ".join(f"{field} = ?" for field in fields)
+    values = [kwargs[field] for field in fields]
+    values.extend([_now_iso(), thread_id])
+    with _DB_LOCK, connect() as conn:
+        conn.execute(
+            f"UPDATE threads SET {assignments}, updated_at = ? WHERE thread_id = ?",
+            values,
+        )
+    return get_thread(thread_id)
 
 
-def thread_output(thread_id: str, page: int = 0, page_size: int = 50) -> dict:
-    """Paginated output. page=0=latest. Returns {lines, total_lines, page, has_more}."""
-    all_lines = get_output_lines(thread_id)
-    total = len(all_lines)
+def create_run(thread_id: str) -> dict[str, Any]:
+    get_thread(thread_id)
+    run_id = generate_run_id()
+    now = _now_iso()
+    get_run_dir(thread_id).mkdir(parents=True, exist_ok=True)
+    with _DB_LOCK, connect() as conn:
+        conn.execute(
+            "INSERT INTO runs (run_id, thread_id, created_at, pid, finished_at, exit_code) VALUES (?, ?, ?, ?, ?, ?)",
+            (run_id, thread_id, now, None, None, None),
+        )
+    return get_run(run_id)
 
-    # page=0 → last page_size lines; page=1 → prior page_size lines; etc.
-    end = total - (page * page_size)
-    start = end - page_size
 
-    has_more = start > 0
-    start = max(0, start)
-    end = max(0, end)
+def get_run(run_id: str) -> dict[str, Any]:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+    if row is None:
+        raise FileNotFoundError(f"run not found: {run_id}")
+    return _row_to_dict(row)
 
-    lines = all_lines[start:end]
+
+def update_run(run_id: str, **kwargs: Any) -> dict[str, Any]:
+    if not kwargs:
+        return get_run(run_id)
+    allowed = {"pid", "finished_at", "exit_code"}
+    unknown = set(kwargs) - allowed
+    if unknown:
+        raise ValueError(f"unknown run fields: {sorted(unknown)}")
+    fields = list(kwargs)
+    assignments = ", ".join(f"{field} = ?" for field in fields)
+    values = [kwargs[field] for field in fields]
+    values.append(run_id)
+    with _DB_LOCK, connect() as conn:
+        conn.execute(f"UPDATE runs SET {assignments} WHERE run_id = ?", values)
+    return get_run(run_id)
+
+
+def append_message(
+    *,
+    direction: str,
+    message_type: str,
+    thread_id: str,
+    run_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    message_id = generate_message_id()
+    created_at = _now_iso()
+    payload_json = json.dumps(payload, sort_keys=True)
+    with _DB_LOCK, connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO messages (
+                message_id, direction, message_type, thread_id, run_id, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                message_id,
+                direction,
+                message_type,
+                thread_id,
+                run_id,
+                payload_json,
+                created_at,
+            ),
+        )
     return {
-        "lines": lines,
-        "total_lines": total,
-        "page": page,
-        "has_more": has_more,
-    }
-
-
-def write_event(thread_id: str, event_type: str, data: dict) -> dict:
-    """Write event file. Returns event dict."""
-    event_id = generate_event_id(event_type)
-    event = {
-        "event_id": event_id,
+        "message_id": message_id,
+        "direction": direction,
+        "message_type": message_type,
         "thread_id": thread_id,
-        "type": event_type,
-        "data": data,
-        "timestamp": _now_iso(),
+        "run_id": run_id,
+        "payload": payload,
+        "created_at": created_at,
     }
-    path = get_thread_dir(thread_id) / "events" / f"{event_id}.json"
-    path.write_text(json.dumps(event, indent=2))
-    return event
 
 
-def _load_event(path: Path) -> dict:
-    return json.loads(path.read_text())
-
-
-def get_thread_events(thread_id: str, page: int = 0, page_size: int = 10) -> dict:
-    """Paginated events sorted newest-first. Returns {events, total, page, has_more}."""
-    events_dir = get_thread_dir(thread_id) / "events"
-    if not events_dir.exists():
-        return {"events": [], "total": 0, "page": page, "has_more": False}
-
-    files = sorted(events_dir.glob("*.json"), key=lambda p: p.name)
-    # Newest first
-    files = list(reversed(files))
-    total = len(files)
-
-    start = page * page_size
-    end = start + page_size
-    page_files = files[start:end]
-    has_more = end < total
-
-    events = [_load_event(f) for f in page_files]
+def get_thread_events(
+    thread_id: str, page: int = 0, page_size: int = 10
+) -> dict[str, Any]:
+    get_thread(thread_id)
+    offset = page * page_size
+    with connect() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE thread_id = ?", (thread_id,)
+        ).fetchone()[0]
+        rows = conn.execute(
+            """
+            SELECT * FROM messages
+            WHERE thread_id = ?
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT ? OFFSET ?
+            """,
+            (thread_id, page_size, offset),
+        ).fetchall()
+    events = [_message_row_to_dict(row) for row in rows]
     return {
         "events": events,
         "total": total,
         "page": page,
-        "has_more": has_more,
+        "has_more": offset + page_size < total,
     }
 
 
-def write_pending(thread_id: str, tool: str, input: dict, mode: str) -> dict:
-    """Write pending approval request. Returns request dict."""
-    req_id = generate_request_id()
-    req = {
-        "request_id": req_id,
-        "thread_id": thread_id,
-        "tool": tool,
-        "input": input,
-        "mode": mode,
-        "created_at": _now_iso(),
+def list_pending_approvals() -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT pr.*
+            FROM messages AS pr
+            WHERE pr.message_type = 'permission_request'
+              AND NOT EXISTS (
+                SELECT 1
+                FROM messages AS rs
+                WHERE rs.message_type = 'permission_resolution'
+                  AND json_extract(rs.payload_json, '$.request_id') = json_extract(pr.payload_json, '$.request_id')
+              )
+            ORDER BY pr.created_at ASC, pr.rowid ASC
+            """
+        ).fetchall()
+    return [_pending_from_row(row) for row in rows]
+
+
+def thread_output(thread_id: str, page: int = 0, page_size: int = 50) -> dict[str, Any]:
+    lines = _thread_output_lines(thread_id)
+    total = len(lines)
+    end = total - (page * page_size)
+    start = max(0, end - page_size)
+    end = max(0, end)
+    return {
+        "lines": lines[start:end],
+        "total_lines": total,
+        "page": page,
+        "has_more": start > 0,
     }
-    path = get_thread_dir(thread_id) / "pending" / f"{req_id}.json"
-    path.write_text(json.dumps(req, indent=2))
-    return req
 
 
-def write_response(
-    request_id: str, thread_id: str, decision: str, decided_by: str
-) -> dict:
-    """Write approval response. Returns response dict."""
-    resp = {
-        "request_id": request_id,
-        "decision": decision,
-        "decided_by": decided_by,
-        "decided_at": _now_iso(),
-    }
-    path = get_thread_dir(thread_id) / "responses" / f"{request_id}.json"
-    path.write_text(json.dumps(resp, indent=2))
-    return resp
-
-
-def get_pending_request(thread_id: str, request_id: str) -> dict | None:
-    """Read pending/{request_id}.json. Returns None if not found."""
-    path = get_thread_dir(thread_id) / "pending" / f"{request_id}.json"
-    if not path.exists():
-        return None
-    return json.loads(path.read_text())
-
-
-def get_response(thread_id: str, request_id: str) -> dict | None:
-    """Read responses/{request_id}.json. Returns None if not found."""
-    path = get_thread_dir(thread_id) / "responses" / f"{request_id}.json"
-    if not path.exists():
-        return None
-    return json.loads(path.read_text())
-
-
-def list_pending_approvals() -> list[dict]:
-    """Return all pending requests with no response file, sorted ascending."""
-    result = []
-    if not THREADS_DIR.exists():
-        return result
-
-    for thread_dir in THREADS_DIR.iterdir():
-        if not thread_dir.is_dir():
-            continue
-        pending_dir = thread_dir / "pending"
-        if not pending_dir.exists():
-            continue
-        for req_file in pending_dir.glob("*.json"):
-            req = json.loads(req_file.read_text())
-            req_id = req["request_id"]
-            thread_id = req["thread_id"]
-            resp = get_response(thread_id, req_id)
-            if resp is None:
-                result.append(req)
-
-    result.sort(key=lambda r: r["created_at"])
-    return result
+def _thread_output_lines(thread_id: str) -> list[str]:
+    run_dir = get_run_dir(thread_id)
+    if not run_dir.exists():
+        return []
+    lines: list[str] = []
+    for path in sorted(run_dir.glob("*.stdout.jsonl")):
+        lines.extend(path.read_text().splitlines(keepends=True))
+    return lines
 
 
 def write_daemon_pid(pid: int) -> None:
@@ -330,17 +332,6 @@ def remove_daemon_pid() -> None:
         path.unlink()
 
 
-def write_hub_session_id(session_id: str) -> None:
-    (SINGLETON_DIR / "hub_session_id").write_text(session_id)
-
-
-def read_hub_session_id() -> str | None:
-    path = SINGLETON_DIR / "hub_session_id"
-    if not path.exists():
-        return None
-    return path.read_text().strip()
-
-
 def write_mcp_port(port: int) -> None:
     (SINGLETON_DIR / "mcp.port").write_text(str(port))
 
@@ -353,3 +344,32 @@ def read_mcp_port() -> int | None:
         return int(path.read_text().strip())
     except ValueError:
         return None
+
+
+def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {key: row[key] for key in row.keys()}
+
+
+def _message_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    payload = json.loads(row["payload_json"])
+    return {
+        "message_id": row["message_id"],
+        "direction": row["direction"],
+        "message_type": row["message_type"],
+        "thread_id": row["thread_id"],
+        "run_id": row["run_id"],
+        "payload": payload,
+        "created_at": row["created_at"],
+    }
+
+
+def _pending_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    payload = json.loads(row["payload_json"])
+    return {
+        "request_id": payload["request_id"],
+        "thread_id": row["thread_id"],
+        "run_id": row["run_id"],
+        "tool": payload["tool_name"],
+        "input": payload["tool_input"],
+        "created_at": row["created_at"],
+    }

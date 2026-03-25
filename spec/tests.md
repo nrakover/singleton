@@ -1,128 +1,158 @@
-# singleton — Test Inventory
+# singleton - Test Inventory
 
-Derived from spec.md and user_flows.md. Tests are organized by component. All automated tests live in `tests/`.
+Derived from the rewritten spec. Tests should favor small protocols and fake implementations over magic mocks.
 
 ---
 
-## T-STORE: State store (`test_store.py`)
+## T-REPO: SQLite repositories (`test_store.py`)
 
 | ID | Description | Type |
 |---|---|---|
-| T-STORE-1 | `create_thread` creates `thread.json` with correct fields (id, description, cwd, status=pending, permissions_mode, created_at) | unit |
-| T-STORE-2 | `create_thread` with `cwd=None` sets cwd to `~/.singleton/workers/default/` | unit |
-| T-STORE-3 | `list_threads` returns all threads sorted by created_at descending | unit |
-| T-STORE-4 | `get_thread` returns full metadata including last_turn_summary | unit |
-| T-STORE-5 | `update_thread_status` transitions status correctly and updates updated_at | unit |
-| T-STORE-6 | Writing an event file creates `events/{event_id}.json` with correct schema | unit |
-| T-STORE-7 | Writing a pending approval creates `pending/{req_id}.json` with correct schema | unit |
-| T-STORE-8 | Writing a response creates `responses/{req_id}.json` with correct schema | unit |
-| T-STORE-9 | `thread_output` pagination: page=0 returns last N lines; page=1 returns prior N lines; has_more is correct | unit |
-| T-STORE-10 | `thread_output` with fewer lines than page_size returns all lines, has_more=False | unit |
-| T-STORE-11 | `get_thread_events` pagination: page=0 returns latest N events; incrementing walks backwards | unit |
-| T-STORE-12 | Concurrent writes to `output.txt` from multiple appends do not corrupt the file | unit |
-| T-STORE-13 | `thread.json` is valid JSON after any store operation | unit |
+| T-REPO-1 | Schema bootstrap creates `threads`, `runs`, and `messages` tables | unit |
+| T-REPO-2 | `create_thread` persists default worker cwd when `cwd=None` | unit |
+| T-REPO-3 | `create_run` persists a run row before process launch | unit |
+| T-REPO-4 | `append_message` persists `direction`, `message_type`, `thread_id`, `run_id`, and payload JSON | unit |
+| T-REPO-5 | Updating `threads.session_id` touches only sparse metadata fields | unit |
+| T-REPO-6 | Updating `runs.pid`, `runs.finished_at`, and `runs.exit_code` leaves other durable data untouched | unit |
+| T-REPO-7 | `list_pending_approvals` derives unresolved requests from `permission_request` minus matching `permission_resolution` | unit |
+| T-REPO-8 | `get_thread_events` paginates newest-first durable messages for one thread | unit |
+| T-REPO-9 | Concurrent append-heavy message writes do not corrupt SQLite state | unit |
 
 ---
 
-## T-WORKER: Worker process management (`test_worker.py`)
+## T-HOOKS: Direct Python hooks (`test_hooks.py`)
 
 | ID | Description | Type |
 |---|---|---|
-| T-WORKER-1 | `spawn_worker` launches subprocess with correct CLI flags for `yolo` mode (`--dangerously-skip-permissions`) | unit |
-| T-WORKER-2 | `spawn_worker` launches subprocess without `--dangerously-skip-permissions` for `supervised` and `passthrough` modes | unit |
-| T-WORKER-3 | `spawn_worker` injects per-thread hooks via `--settings` flag (not modifying project settings) | unit |
-| T-WORKER-4 | `spawn_worker` sets CWD to specified directory | unit |
-| T-WORKER-5 | `send_turn` writes correct stream-json user-turn format to worker stdin | unit |
-| T-WORKER-6 | `send_turn` reads and parses `result` event from worker stdout | unit |
-| T-WORKER-7 | `send_turn` extracts assistant text content (ignores tool_use blocks) for summary | unit |
-| T-WORKER-8 | `send_turn` returns result_text truncated to ≤500 chars when longer | unit |
-| T-WORKER-9 | `cancel_worker` sends SIGTERM to worker process | unit |
-| T-WORKER-10 | Worker output is appended to `output.txt` after each turn | unit |
-| T-WORKER-11 | Mock stream-json worker receives multiple sequential turns correctly | integration |
+| T-HOOKS-1 | `SessionStart` hook writes `run_started` with `session_id` and `run_id` | unit |
+| T-HOOKS-2 | `PermissionRequest` hook writes `permission_request` with tool input and suggestions | unit |
+| T-HOOKS-3 | `PermissionRequest` hook returns allow when matching `permission_resolution` is approved | unit |
+| T-HOOKS-4 | `PermissionRequest` hook returns deny with freeform reason when matching resolution is denied | unit |
+| T-HOOKS-5 | `PermissionRequest` hook times out safely when no resolution arrives | unit |
+| T-HOOKS-6 | `Stop` hook writes `run_finished` with `outcome=completed` and `last_assistant_message` | unit |
+| T-HOOKS-7 | `StopFailure` hook writes `run_finished` with `outcome=api_error`, `error`, and `error_details` | unit |
+| T-HOOKS-8 | `Notification` hook writes `notification` message | unit |
 
 ---
 
-## T-DAEMON: Daemon event loop and injection (`test_daemon.py`)
+## T-WORKER: Worker session manager (`test_worker.py`)
 
 | ID | Description | Type |
 |---|---|---|
-| T-DAEMON-1 | File watcher detects new event file in `threads/{id}/events/` within 500ms | unit |
-| T-DAEMON-2 | Injection is queued when `hub_busy=True` | unit |
-| T-DAEMON-3 | Queued injection fires when hub output goes quiet for >200ms | unit |
-| T-DAEMON-4 | Up to 10 injections can be queued; 11th is logged and dropped | unit |
-| T-DAEMON-5 | Worker `Stop` event triggers summary injection into hub pty | integration |
-| T-DAEMON-6 | Worker `supervised` approval event triggers approval injection into hub pty | integration |
-| T-DAEMON-7 | Passthrough approval suspends pty relay, prompts user tty, resumes relay after response | integration |
-| T-DAEMON-8 | Daemon writes `daemon.pid` on start; removes it on clean stop | unit |
-| T-DAEMON-9 | Daemon binds Unix socket at `~/.singleton/daemon.sock`; removes it on clean stop | unit |
-| T-DAEMON-10 | MCP HTTP server starts on configured port; responds to `GET /health` | unit |
-| T-DAEMON-11 | Multiple CLI connections receive same hub pty output (fan-out) | integration |
-| T-DAEMON-12 | Input from any attached CLI connection is forwarded to hub pty | integration |
+| T-WORKER-1 | New run row is created before worker spawn | unit |
+| T-WORKER-2 | Spawn command injects direct Python hooks instead of bash wrapper scripts | unit |
+| T-WORKER-3 | Spawn command includes `SINGLETON_THREAD_ID` and `SINGLETON_RUN_ID` env vars | unit |
+| T-WORKER-4 | Follow-up run uses `--resume <session_id>` when thread metadata contains one | unit |
+| T-WORKER-5 | `yolo` mode uses Claude-native bypass permissions while other modes do not | unit |
+| T-WORKER-6 | Stdout stream is teed to `{run_id}.stdout.jsonl` | unit |
+| T-WORKER-7 | Stderr stream is teed to `{run_id}.stderr.jsonl` | unit |
+| T-WORKER-8 | Abnormal subprocess exit without `run_finished` is reconciled as fallback failure state | integration |
+| T-WORKER-9 | Worker run updates `threads.session_id` from hook-authored lifecycle data | integration |
 
 ---
 
-## T-MCP: MCP tool behavior (`test_mcp.py`)
+## T-HUB: Hub controller (`test_hub.py`)
 
 | ID | Description | Type |
 |---|---|---|
-| T-MCP-1 | `create_thread` returns `{thread_id}` and thread appears in `list_threads` | integration |
-| T-MCP-2 | `list_threads` returns empty list when no threads exist | unit |
-| T-MCP-3 | `get_thread` returns 404-equivalent error for unknown thread_id | unit |
-| T-MCP-4 | `thread_output` returns correct paginated lines with proper `has_more` flag | integration |
-| T-MCP-5 | `get_thread_events` returns paginated events newest-first | integration |
-| T-MCP-6 | `send_to_thread` returns `result_text` from mock worker | integration |
-| T-MCP-7 | `cancel_thread` updates thread status to `cancelled` | integration |
-| T-MCP-8 | `set_thread_permissions` updates `thread.json` permissions_mode | unit |
-| T-MCP-9 | `list_pending_approvals` returns only unresolved requests | unit |
-| T-MCP-10 | `approve_tool_call` writes approve response file; hook unblocks | integration |
-| T-MCP-11 | `deny_tool_call` writes deny response file; hook exits 2 | integration |
-| T-MCP-12 | `set_thread_permissions` to `yolo` causes subsequent `PreToolUse` hook to auto-approve | integration |
+| T-HUB-1 | Hub process launches as daemon-owned long-lived streamed session | unit |
+| T-HUB-2 | Hub controller writes prompts to hub stdin and receives streamed output in memory | unit |
+| T-HUB-3 | Hub MCP config is written to `.mcp.json`, not `settings.json` | unit |
+| T-HUB-4 | Singleton MCP tools are pre-allowed in hub settings | unit |
 
 ---
 
-## T-HOOKS: Hook scripts (`test_hooks.sh` / shell-based)
+## T-DAEMON: Daemon state and recovery (`test_daemon.py`)
 
 | ID | Description | Type |
 |---|---|---|
-| T-HOOKS-1 | `worker-stop.sh` writes stop event file with correct schema | unit |
-| T-HOOKS-2 | `worker-pretool.sh` writes pending request file when mode is `supervised` | unit |
-| T-HOOKS-3 | `worker-pretool.sh` polls response file and exits 0 when approved | unit |
-| T-HOOKS-4 | `worker-pretool.sh` polls response file and exits 2 when denied | unit |
-| T-HOOKS-5 | `worker-pretool.sh` exits 2 after timeout (300 iterations) | unit |
-| T-HOOKS-6 | `worker-pretool.sh` in `yolo` mode exits 0 immediately without writing files | unit |
-| T-HOOKS-7 | `worker-notify.sh` writes notification event file with correct schema | unit |
+| T-DAEMON-1 | Daemon writes `daemon.pid` and binds `daemon.sock` on start | unit |
+| T-DAEMON-2 | Daemon serves MCP on configured port | unit |
+| T-DAEMON-3 | Daemon rebuilds unresolved permission requests from SQLite on restart | integration |
+| T-DAEMON-4 | Daemon restart does not require worker subprocesses to stop first | integration |
+| T-DAEMON-5 | Worker hooks continue appending durable messages while daemon is down | integration |
+| T-DAEMON-6 | Daemon surfaces `run_finished` from hook-authored messages rather than stdout parsing | integration |
+| T-DAEMON-7 | `approve_tool_call` appends `permission_resolution` and unblocks the hook | integration |
+| T-DAEMON-8 | `deny_tool_call` appends `permission_resolution` with reason and blocks the hook | integration |
+| T-DAEMON-9 | Daemon rebuilds canonical runtime state from durable worker-plane data for fresh attaches | integration |
 
 ---
 
-## T-CLI: CLI behavior (manual / integration)
+## T-TUI: Multi-attach rendering (`test_tui.py`)
 
 | ID | Description | Type |
 |---|---|---|
-| T-CLI-1 | `singleton` with no daemon running starts daemon and attaches | manual |
-| T-CLI-2 | `singleton` with daemon running attaches without starting a new daemon | manual |
-| T-CLI-3 | `singleton attach` is equivalent to `singleton` when daemon is running | manual |
-| T-CLI-4 | `singleton status` prints thread status board and exits without attaching | manual |
-| T-CLI-5 | `singleton stop` stops daemon, hub, and all workers gracefully | manual |
-| T-CLI-6 | `Ctrl+b d` detaches CLI without disrupting hub or workers | manual |
-| T-CLI-7 | `Ctrl+b ?` prints prefix command help in relay | manual |
-| T-CLI-8 | Non-prefix control sequences (e.g. `Ctrl+c`, `Ctrl+l`) are forwarded to hub | manual |
-| T-CLI-9 | Second terminal running `singleton attach` receives same hub output | manual |
-| T-CLI-10 | Input from second attached terminal reaches hub | manual |
+| T-TUI-1 | Multiple attached clients receive mirrored rendered state | integration |
+| T-TUI-2 | Exactly one client owns freeform hub input at a time | integration |
+| T-TUI-3 | Non-owning clients can observe but not type into the hub | integration |
+| T-TUI-4 | Control handoff updates ownership cleanly | integration |
+| T-TUI-5 | Passthrough approval is routed to the active input owner | integration |
+| T-TUI-6 | Detach removes only that client, not daemon or hub state | integration |
 
 ---
 
-## T-FLOWS: End-to-end user flows (manual)
+## T-MCP: MCP behavior (`test_mcp.py`)
+
+| ID | Description | Type |
+|---|---|---|
+| T-MCP-1 | `create_thread` returns `{thread_id}` and persists durable thread metadata | integration |
+| T-MCP-2 | `send_to_thread` creates a run and returns terminal summary from `run_finished` | integration |
+| T-MCP-3 | `thread_output` paginates JSONL-backed run output correctly | integration |
+| T-MCP-4 | `get_thread_events` returns durable lifecycle messages newest-first | integration |
+| T-MCP-5 | `set_thread_permissions` updates future-run permission mode | unit |
+| T-MCP-6 | `list_pending_approvals` returns unresolved permission requests only | integration |
+| T-MCP-7 | `deny_tool_call(request_id, reason)` persists deny reason for hook consumption | integration |
+| T-MCP-8 | `cancel_thread` cancels the active run for a thread when one exists | integration |
+
+---
+
+## T-MANUAL: Manual verification gate
+
+These checks are intentionally manual because they rely on real terminal behavior, real Claude Code process interaction, or multi-client UX details that are difficult to verify programmatically with acceptable confidence.
+
+These manual checks must be re-run by the coding agent before marking any major implementation task complete, in addition to the required automated validation commands.
+
+| ID | Description | Type |
+|---|---|---|
+| T-MANUAL-1 | Real `singleton` attach launches the daemon, hub, and TUI cleanly in a real terminal | manual |
+| T-MANUAL-2 | Real `Ctrl+b d` detaches only the current client and leaves daemon state intact | manual |
+| T-MANUAL-3 | Real multi-attach mirrors state across two terminals and enforces single input ownership | manual |
+| T-MANUAL-4 | Real passthrough permission prompt is routed to the active input owner and returns the decision to Claude | manual |
+| T-MANUAL-5 | Real daemon crash/restart preserves in-flight worker durability through SQLite and logs | manual |
+
+---
+
+## T-CLI: Manual behavior
+
+| ID | Description | Type |
+|---|---|---|
+| T-CLI-1 | `singleton` starts daemon and attaches when not running | manual |
+| T-CLI-2 | `singleton attach` adds a second mirrored client | manual |
+| T-CLI-3 | `singleton status` prints thread and approval summary without attaching | manual |
+| T-CLI-4 | `Ctrl+b d` detaches only the current client | manual |
+| T-CLI-5 | Input ownership can be handed from one terminal to another | manual |
+
+---
+
+## T-FLOWS: End-to-end flows
 
 | ID | Flow | Covers |
 |---|---|---|
-| T-FLOWS-1 | UF-1: First-time setup and launch | setup.sh, daemon start, hub attach |
-| T-FLOWS-2 | UF-2: Create supervised thread via `/new-thread` | skill, create_thread, worker spawn |
-| T-FLOWS-3 | UF-3: Worker approval request handled by hub autonomously | PreToolUse hook, injection, approve_tool_call |
-| T-FLOWS-4 | UF-4: Worker completes turn; hub receives summary injection | Stop hook, result parsing, injection |
-| T-FLOWS-5 | UF-5: Hub inspects thread output across multiple pages | thread_output pagination |
-| T-FLOWS-6 | UF-6: Hub sends follow-up to idle worker | send_to_thread |
-| T-FLOWS-7 | UF-7: Detach with Ctrl+b d; re-attach with singleton | pty persistence, CLI relay |
-| T-FLOWS-8 | UF-9: Passthrough thread with direct user approval | passthrough mode, pty relay suspend |
-| T-FLOWS-9 | UF-10: `/threads` shows status board with pending approvals | list_threads, list_pending_approvals, skill |
-| T-FLOWS-10 | UF-12: Permission mode changed mid-thread from supervised to yolo | set_thread_permissions, hook mode check |
-| T-FLOWS-11 | UF-13: Daemon crash recovery; threads intact after restart | crash recovery, hub resume |
+| T-FLOWS-1 | UF-1 setup and launch | setup, daemon, hub, TUI |
+| T-FLOWS-2 | UF-3 start work on a thread | run creation, worker spawn, completion |
+| T-FLOWS-3 | UF-4 supervised permission request | `PermissionRequest`, MCP approval |
+| T-FLOWS-4 | UF-5 passthrough permission request | active-owner routing |
+| T-FLOWS-5 | UF-9 follow-up run resumes prior session | `session_id` continuity |
+| T-FLOWS-6 | UF-11 multi-attach ownership handoff | TUI ownership rules |
+| T-FLOWS-7 | UF-12 daemon crash while worker continues | recovery from SQLite + logs |
+
+---
+
+## Coverage Notes
+
+- `spec/spec.md` sections 2-8 are covered by T-REPO, T-HOOKS, T-WORKER, T-HUB, T-DAEMON, T-TUI, and T-MCP.
+- `spec/spec.md` sections 3 and the real-terminal aspects of sections 6-8 also require the T-MANUAL gate.
+- Every major task completion requires:
+  - all automated validation commands to pass
+  - all relevant automated tests for the changed scope to pass
+  - the T-MANUAL checks that exercise changed real-terminal or real-Claude behavior to be re-verified

@@ -1,264 +1,234 @@
-"""Tests for hook scripts (T-HOOKS-1 through T-HOOKS-7)."""
+"""Tests for direct Python hook entrypoints."""
+
+from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
+import threading
 import time
-from pathlib import Path
-
-import pytest
 
 import singleton.store as store
 
-HOOKS_DIR = Path(__file__).parent.parent / "hooks"
+
+def test_session_start_hook_writes_run_started(tmp_path, monkeypatch):
+    _configure_store(tmp_path, monkeypatch)
+    thread = store.create_thread(description="Thread")
+    run = store.create_run(thread["thread_id"])
+
+    result = _run_hook(
+        "session-start",
+        thread["thread_id"],
+        run["run_id"],
+        {"session_id": "sess-123", "source": "startup"},
+    )
+
+    assert result.returncode == 0
+    events = store.get_thread_events(thread["thread_id"])
+    assert events["events"][0]["message_type"] == "run_started"
+    assert events["events"][0]["payload"]["session_id"] == "sess-123"
 
 
-@pytest.fixture(autouse=True)
-def patch_store_dirs(tmp_path, monkeypatch):
-    """Override store dirs to use tmp_path."""
-    singleton_dir = tmp_path / ".singleton"
-    threads_dir = singleton_dir / "threads"
-    monkeypatch.setattr(store, "SINGLETON_DIR", singleton_dir)
-    monkeypatch.setattr(store, "THREADS_DIR", threads_dir)
-    store.init_dirs()
-    return singleton_dir
+def test_permission_request_hook_writes_request(tmp_path, monkeypatch):
+    _configure_store(tmp_path, monkeypatch)
+    thread = store.create_thread(description="Thread")
+    run = store.create_run(thread["thread_id"])
+
+    def approve() -> None:
+        _wait_for_message_count(thread["thread_id"], 1)
+        store.append_message(
+            direction="to_worker",
+            message_type="permission_resolution",
+            thread_id=thread["thread_id"],
+            run_id=run["run_id"],
+            payload={"request_id": "req-1", "decision": "allow", "resolved_by": "hub"},
+        )
+
+    worker = threading.Thread(target=approve)
+    worker.start()
+    result = _run_hook(
+        "permission-request",
+        thread["thread_id"],
+        run["run_id"],
+        {
+            "request_id": "req-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push"},
+            "permission_suggestions": [],
+        },
+    )
+    worker.join()
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout.decode())
+    assert payload["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+    pending = store.list_pending_approvals()
+    assert pending == []
+
+
+def test_permission_request_hook_denies_with_reason(tmp_path, monkeypatch):
+    _configure_store(tmp_path, monkeypatch)
+    thread = store.create_thread(description="Thread")
+    run = store.create_run(thread["thread_id"])
+
+    def deny() -> None:
+        _wait_for_message_count(thread["thread_id"], 1)
+        store.append_message(
+            direction="to_worker",
+            message_type="permission_resolution",
+            thread_id=thread["thread_id"],
+            run_id=run["run_id"],
+            payload={
+                "request_id": "req-2",
+                "decision": "deny",
+                "resolved_by": "hub",
+                "reason": "Too risky",
+            },
+        )
+
+    worker = threading.Thread(target=deny)
+    worker.start()
+    result = _run_hook(
+        "permission-request",
+        thread["thread_id"],
+        run["run_id"],
+        {
+            "request_id": "req-2",
+            "tool_name": "Bash",
+            "tool_input": {"command": "rm -rf /"},
+        },
+    )
+    worker.join()
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout.decode())
+    assert payload["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+    assert payload["hookSpecificOutput"]["decision"]["message"] == "Too risky"
+
+
+def test_permission_request_hook_times_out(tmp_path, monkeypatch):
+    _configure_store(tmp_path, monkeypatch)
+    thread = store.create_thread(description="Thread")
+    run = store.create_run(thread["thread_id"])
+
+    result = _run_hook(
+        "permission-request",
+        thread["thread_id"],
+        run["run_id"],
+        {
+            "request_id": "req-timeout",
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "x.py"},
+        },
+        extra_env={
+            "SINGLETON_PERMISSION_TIMEOUT": "0.2",
+            "SINGLETON_PERMISSION_POLL_INTERVAL": "0.05",
+        },
+    )
+
+    assert result.returncode == 2
+
+
+def test_stop_hook_writes_completed_run_finished(tmp_path, monkeypatch):
+    _configure_store(tmp_path, monkeypatch)
+    thread = store.create_thread(description="Thread")
+    run = store.create_run(thread["thread_id"])
+
+    result = _run_hook(
+        "stop",
+        thread["thread_id"],
+        run["run_id"],
+        {"session_id": "sess-123", "last_assistant_message": "Done."},
+    )
+
+    assert result.returncode == 0
+    event = store.get_thread_events(thread["thread_id"])["events"][0]
+    assert event["message_type"] == "run_finished"
+    assert event["payload"]["outcome"] == "completed"
+    assert event["payload"]["result_text"] == "Done."
+
+
+def test_stop_failure_hook_writes_api_error(tmp_path, monkeypatch):
+    _configure_store(tmp_path, monkeypatch)
+    thread = store.create_thread(description="Thread")
+    run = store.create_run(thread["thread_id"])
+
+    result = _run_hook(
+        "stop-failure",
+        thread["thread_id"],
+        run["run_id"],
+        {
+            "session_id": "sess-123",
+            "error": "rate_limit",
+            "error_details": "429 Too Many Requests",
+            "last_assistant_message": "API Error",
+        },
+    )
+
+    assert result.returncode == 0
+    event = store.get_thread_events(thread["thread_id"])["events"][0]
+    assert event["payload"]["outcome"] == "api_error"
+    assert event["payload"]["error"] == "rate_limit"
+
+
+def test_notification_hook_writes_notification_message(tmp_path, monkeypatch):
+    _configure_store(tmp_path, monkeypatch)
+    thread = store.create_thread(description="Thread")
+    run = store.create_run(thread["thread_id"])
+
+    result = _run_hook(
+        "notification",
+        thread["thread_id"],
+        run["run_id"],
+        {"message": "Heads up"},
+    )
+
+    assert result.returncode == 0
+    event = store.get_thread_events(thread["thread_id"])["events"][0]
+    assert event["message_type"] == "notification"
+    assert event["payload"]["text"] == "Heads up"
 
 
 def _run_hook(
-    script: str,
+    hook_name: str,
     thread_id: str,
-    state_dir: Path,
-    stdin_data: dict | None = None,
-    extra_env: dict | None = None,
-    timeout: int = 10,
-) -> subprocess.CompletedProcess:
-    """Run a hook script with proper env vars."""
-    import os
-
+    run_id: str,
+    stdin_data: dict,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[bytes]:
     env = os.environ.copy()
-    env["SINGLETON_THREAD_ID"] = thread_id
-    env["SINGLETON_STATE_DIR"] = str(state_dir)
-    env["SINGLETON_HOOKS_DIR"] = str(HOOKS_DIR)
+    env.update(
+        {
+            "SINGLETON_THREAD_ID": thread_id,
+            "SINGLETON_RUN_ID": run_id,
+            "SINGLETON_STATE_DIR": str(store.SINGLETON_DIR),
+            "SINGLETON_DB_PATH": str(store.DB_PATH),
+        }
+    )
     if extra_env:
         env.update(extra_env)
-
-    stdin_bytes = json.dumps(stdin_data).encode() if stdin_data is not None else b"{}"
-
     return subprocess.run(
-        [str(HOOKS_DIR / script)],
-        input=stdin_bytes,
+        [sys.executable, "-m", "singleton.hooks", hook_name],
+        input=json.dumps(stdin_data).encode(),
         capture_output=True,
         env=env,
-        timeout=timeout,
+        timeout=10,
     )
 
 
-# T-HOOKS-1: worker-stop.sh creates event file with stop type
-def test_stop_hook_creates_event(tmp_path):
-    thread = store.create_thread(description="Stop hook test")
-    tid = thread["id"]
-    state_dir = store.SINGLETON_DIR
-
-    result = _run_hook(
-        "worker-stop.sh",
-        tid,
-        state_dir,
-        stdin_data={"session_id": "sess-abc123"},
-    )
-
-    assert result.returncode == 0, result.stderr.decode()
-
-    events_dir = store.get_thread_dir(tid) / "events"
-    event_files = list(events_dir.glob("*.json"))
-    assert len(event_files) == 1
-
-    event = json.loads(event_files[0].read_text())
-    assert event["type"] == "stop"
-    assert event["thread_id"] == tid
-    assert event["data"]["session_id"] == "sess-abc123"
-    assert "event_id" in event
-    assert "timestamp" in event
+def _wait_for_message_count(thread_id: str, count: int) -> None:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if store.get_thread_events(thread_id)["total"] >= count:
+            return
+        time.sleep(0.05)
+    raise AssertionError("timed out waiting for messages")
 
 
-# T-HOOKS-2: worker-stop.sh event_id format
-def test_stop_hook_event_id_format(tmp_path):
-    thread = store.create_thread(description="Event ID test")
-    tid = thread["id"]
-    state_dir = store.SINGLETON_DIR
-
-    result = _run_hook("worker-stop.sh", tid, state_dir, stdin_data={"session_id": ""})
-    assert result.returncode == 0
-
-    events_dir = store.get_thread_dir(tid) / "events"
-    event_files = list(events_dir.glob("*.json"))
-    event = json.loads(event_files[0].read_text())
-
-    # event_id format: {unix_ms}-stop-{random4}
-    parts = event["event_id"].split("-")
-    assert len(parts) == 3
-    assert int(parts[0]) > 0  # unix ms
-    assert parts[1] == "stop"
-    assert len(parts[2]) == 4  # 2 hex bytes = 4 chars
-
-
-# T-HOOKS-3: worker-notify.sh creates notification event
-def test_notify_hook_creates_event(tmp_path):
-    thread = store.create_thread(description="Notify hook test")
-    tid = thread["id"]
-    state_dir = store.SINGLETON_DIR
-
-    result = _run_hook(
-        "worker-notify.sh",
-        tid,
-        state_dir,
-        stdin_data={"message": "Task completed"},
-    )
-
-    assert result.returncode == 0, result.stderr.decode()
-
-    events_dir = store.get_thread_dir(tid) / "events"
-    event_files = list(events_dir.glob("*.json"))
-    assert len(event_files) == 1
-
-    event = json.loads(event_files[0].read_text())
-    assert event["type"] == "notification"
-    assert event["thread_id"] == tid
-    assert event["data"]["message"] == "Task completed"
-
-
-# T-HOOKS-4: worker-pretool.sh yolo mode exits 0 without creating pending
-def test_pretool_hook_yolo_exits_0(tmp_path):
-    thread = store.create_thread(
-        description="Yolo pretool test", permissions_mode="yolo"
-    )
-    tid = thread["id"]
-    state_dir = store.SINGLETON_DIR
-
-    result = _run_hook(
-        "worker-pretool.sh",
-        tid,
-        state_dir,
-        stdin_data={"tool_name": "Bash", "tool_input": {"command": "ls"}},
-    )
-
-    assert result.returncode == 0
-    # No pending files created
-    pending_dir = store.get_thread_dir(tid) / "pending"
-    assert len(list(pending_dir.glob("*.json"))) == 0
-
-
-# T-HOOKS-5: worker-pretool.sh supervised mode creates pending, exits 2 on timeout
-def test_pretool_hook_supervised_timeout(tmp_path):
-    thread = store.create_thread(
-        description="Supervised pretool test", permissions_mode="supervised"
-    )
-    tid = thread["id"]
-    state_dir = store.SINGLETON_DIR
-
-    # Use short timeout (3 seconds)
-    result = _run_hook(
-        "worker-pretool.sh",
-        tid,
-        state_dir,
-        stdin_data={"tool_name": "Bash", "tool_input": {"command": "ls"}},
-        extra_env={"SINGLETON_PRETOOL_TIMEOUT": "3"},
-        timeout=15,
-    )
-
-    assert result.returncode == 2
-
-    # Pending file should exist
-    pending_dir = store.get_thread_dir(tid) / "pending"
-    pending_files = list(pending_dir.glob("*.json"))
-    assert len(pending_files) == 1
-
-    pending = json.loads(pending_files[0].read_text())
-    assert pending["tool"] == "Bash"
-    assert pending["mode"] == "supervised"
-
-
-# T-HOOKS-6: worker-pretool.sh supervised mode approves when response written
-def test_pretool_hook_supervised_approve(tmp_path):
-    thread = store.create_thread(
-        description="Approved pretool test", permissions_mode="supervised"
-    )
-    tid = thread["id"]
-    state_dir = store.SINGLETON_DIR
-
-    # We need to write the response file asynchronously while the hook polls
-    # Use a thread to write the response after a short delay
-    import threading
-
-    response_written = threading.Event()
-
-    def write_approval():
-        # Wait a bit for the pending file to be created
-        time.sleep(1.5)
-        pending_dir = store.get_thread_dir(tid) / "pending"
-        # Wait for pending file
-        for _ in range(20):
-            files = list(pending_dir.glob("*.json"))
-            if files:
-                break
-            time.sleep(0.1)
-
-        if files:
-            req = json.loads(files[0].read_text())
-            req_id = req["request_id"]
-            store.write_response(req_id, tid, "approve", "hub")
-        response_written.set()
-
-    t = threading.Thread(target=write_approval)
-    t.start()
-
-    result = _run_hook(
-        "worker-pretool.sh",
-        tid,
-        state_dir,
-        stdin_data={"tool_name": "Write", "tool_input": {"path": "/tmp/x"}},
-        extra_env={"SINGLETON_PRETOOL_TIMEOUT": "30"},
-        timeout=15,
-    )
-
-    t.join(timeout=5)
-    assert result.returncode == 0
-
-
-# T-HOOKS-7: worker-pretool.sh supervised mode denies when response is deny
-def test_pretool_hook_supervised_deny(tmp_path):
-    thread = store.create_thread(
-        description="Denied pretool test", permissions_mode="supervised"
-    )
-    tid = thread["id"]
-    state_dir = store.SINGLETON_DIR
-
-    import threading
-
-    def write_denial():
-        time.sleep(1.5)
-        pending_dir = store.get_thread_dir(tid) / "pending"
-        for _ in range(20):
-            files = list(pending_dir.glob("*.json"))
-            if files:
-                break
-            time.sleep(0.1)
-
-        if files:
-            req = json.loads(files[0].read_text())
-            req_id = req["request_id"]
-            store.write_response(req_id, tid, "deny", "hub")
-
-    t = threading.Thread(target=write_denial)
-    t.start()
-
-    result = _run_hook(
-        "worker-pretool.sh",
-        tid,
-        state_dir,
-        stdin_data={"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}},
-        extra_env={"SINGLETON_PRETOOL_TIMEOUT": "30"},
-        timeout=15,
-    )
-
-    t.join(timeout=5)
-    assert result.returncode == 2
-    assert b"denied" in result.stdout.lower() or b"denied" in result.stderr.lower()
+def _configure_store(tmp_path, monkeypatch):
+    singleton_dir = tmp_path / ".singleton"
+    monkeypatch.setattr(store, "SINGLETON_DIR", singleton_dir)
+    monkeypatch.setattr(store, "THREADS_DIR", singleton_dir / "threads")
+    monkeypatch.setattr(store, "DB_PATH", singleton_dir / "messages.db")
+    store.init_dirs()
