@@ -4,7 +4,11 @@
 
 Implement the full `singleton` system as specified in `spec/spec.md`, `spec/user_flows.md`, and `spec/tests.md`. Deliver a working `singleton` CLI that a user can install and run to get the hub+daemon+worker system operational.
 
-Note: this bootstrap plan has been superseded architecturally by `project_tasks/1_streamed-architecture-reset.md`. Keep this file as the historical bootstrap record; current implementation work should follow the newer task plan and synchronized spec artifacts.
+Note: this bootstrap plan has been superseded twice: first by
+`project_tasks/1_streamed-architecture-reset.md`, and now by
+`project_tasks/2_agent-session-mcp-pivot.md`. Keep this file as the historical
+bootstrap record; current implementation work should follow Task 2 and the
+synchronized spec artifacts.
 
 ---
 
@@ -122,6 +126,11 @@ README.md
 ---
 
 ## Key Implementation Details
+
+These details describe the superseded Python/Claude hub bootstrap design. The
+current implementation target is the Rust MCP session broker in
+`project_tasks/2_agent-session-mcp-pivot.md`; new work should not extend these
+interfaces except for legacy maintenance or migration reference.
 
 ### stream-json turn format (workers)
 ```json

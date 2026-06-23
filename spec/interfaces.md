@@ -1,371 +1,606 @@
-# singleton - Interface Specifications
+# singleton - Interface Specification
 
-This document defines the current cross-component contracts for the rewritten architecture: daemon/client socket messages, MCP tools, SQLite schema, hook contracts, worker spawn rules, and TUI ownership behavior.
+## 1. Scope
 
----
+This file defines the public and internal contracts for the Rust MCP session
+broker. It supersedes the prior Python/FastMCP daemon, hub, worker, hook, and
+TUI interfaces.
 
-## Interface Map
-
-```
-User terminal -> singleton CLI/TUI client
-                        |
-                 daemon.sock (unix socket)
-                        |
-                      Daemon
-                 +------+--------+
-                 |               |
-          Hub controller      Worker session manager
-          (in-memory)         (spawns one run/process)
-                 |               |
-          claude -p hub     claude -p worker runs
-                                 |
-                    direct Python hook commands
-                                 |
-                           SQLite messages.db
-                                 |
-                          JSONL stdout/stderr logs
-```
+The MVP public interface is an MCP server. The CLI is an admin/client utility,
+not the primary product UX.
 
 ---
 
-## I-1: CLI <-> Daemon Unix Socket Protocol
+## 2. Resource Identity
 
-Socket path: `~/.singleton/daemon.sock`
+Every durable entity has both an ordinary id and a stable resource URI. MCP
+tool responses may use concise ids, but the store and event model must retain
+URIs so future AHP adapters do not require a migration.
 
-All socket messages are newline-delimited JSON.
+URI forms:
 
-### CLI -> Daemon
-
-#### `attach`
-```json
-{"type": "attach", "tty_rows": 40, "tty_cols": 120}
-```
-
-#### `detach`
-```json
-{"type": "detach"}
-```
-
-#### `input`
-```json
-{"type": "input", "data": "<base64-encoded bytes>"}
-```
-
-#### `resize`
-```json
-{"type": "resize", "tty_rows": 45, "tty_cols": 130}
-```
-
-#### `status_request`
-```json
-{"type": "status_request"}
-```
-
-#### `take_control`
-```json
-{"type": "take_control"}
-```
-
-#### `passthrough_response`
-```json
-{"type": "passthrough_response", "request_id": "req_abc", "decision": "deny", "reason": "Too risky"}
-```
-
-### Daemon -> CLI
-
-#### `render`
-```json
-{"type": "render", "view_model": {...}}
-```
-
-#### `status_response`
-```json
-{"type": "status_response", "threads": [...], "pending_approvals": [...]} 
-```
-
-#### `control_granted`
-```json
-{"type": "control_granted"}
-```
-
-#### `control_denied`
-```json
-{"type": "control_denied", "owner": "client_2"}
-```
-
-#### `passthrough_prompt`
-```json
-{"type": "passthrough_prompt", "request_id": "req_abc", "thread_id": "t1", "tool": "Bash", "input": {"command": "..."}}
-```
-
-#### `ack`
-```json
-{"type": "ack"}
-```
-
-#### `error`
-```json
-{"type": "error", "message": "..."}
-```
-
----
-
-## I-2: MCP Tool Interface
-
-Transport: FastMCP HTTP on `http://127.0.0.1:{port}/mcp`
-
-Hub connects by running from `~/.singleton/hub/`, which contains `.mcp.json`. `mcpServers` must not be placed in `settings.json`.
-
-Tools:
-
-- `create_thread(description, context="", cwd=None, permissions_mode="supervised") -> {thread_id}`
-- `list_threads() -> [...]`
-- `get_thread(thread_id) -> {...}`
-- `thread_output(thread_id, page=0, page_size=50) -> {...}`
-- `get_thread_events(thread_id, page=0, page_size=10) -> {...}`
-- `send_to_thread(thread_id, message) -> {result_text, outcome}`
-- `cancel_thread(thread_id) -> {cancelled: bool}`
-- `set_thread_permissions(thread_id, mode) -> {updated: bool, mode: str}`
-- `list_pending_approvals() -> [...]`
-- `approve_tool_call(request_id) -> {approved: bool}`
-- `deny_tool_call(request_id, reason="") -> {denied: bool}`
-
-`send_to_thread` creates a new run and waits for the terminal `run_finished` event associated with that run.
-
----
-
-## I-3: SQLite Schema
-
-Database path: `~/.singleton/messages.db`
-
-### `threads`
-```sql
-CREATE TABLE threads (
-  thread_id TEXT PRIMARY KEY,
-  description TEXT NOT NULL,
-  context TEXT NOT NULL,
-  cwd TEXT NOT NULL,
-  permissions_mode TEXT NOT NULL,
-  session_id TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-```
-
-### `runs`
-```sql
-CREATE TABLE runs (
-  run_id TEXT PRIMARY KEY,
-  thread_id TEXT NOT NULL REFERENCES threads(thread_id),
-  created_at TEXT NOT NULL,
-  pid INTEGER,
-  finished_at TEXT,
-  exit_code INTEGER
-);
-```
-
-### `messages`
-```sql
-CREATE TABLE messages (
-  message_id TEXT PRIMARY KEY,
-  direction TEXT NOT NULL,
-  message_type TEXT NOT NULL,
-  thread_id TEXT NOT NULL REFERENCES threads(thread_id),
-  run_id TEXT NOT NULL REFERENCES runs(run_id),
-  payload_json TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-```
-
-`direction` values:
-- `to_worker`
-- `from_worker`
-
-`message_type` values:
-- `run_started`
-- `permission_request`
-- `permission_resolution`
-- `run_finished`
-- `notification`
-
-SQLite usage rules:
-- prefer inserts over updates
-- only sparse metadata is updated in `threads` and `runs`
-- no durable daemon-originated request queue exists in v1
-
----
-
-## I-4: Durable Message Payloads
-
-### `run_started`
-Direction: `from_worker`
-```json
-{
-  "session_id": "session-uuid",
-  "source": "startup"
-}
-```
-
-### `permission_request`
-Direction: `from_worker`
-```json
-{
-  "request_id": "req_123",
-  "tool_name": "Bash",
-  "tool_input": {"command": "rm -rf build"},
-  "permission_mode": "supervised",
-  "permission_suggestions": []
-}
-```
-
-### `permission_resolution`
-Direction: `to_worker`
-```json
-{
-  "request_id": "req_123",
-  "decision": "deny",
-  "resolved_by": "hub",
-  "reason": "Need explicit review first"
-}
-```
-
-### `run_finished`
-Direction: `from_worker`
-```json
-{
-  "outcome": "completed",
-  "session_id": "session-uuid",
-  "result_text": "Updated the API client and tests.",
-  "error": null,
-  "error_details": null
-}
-```
-
-Failure example:
-```json
-{
-  "outcome": "api_error",
-  "session_id": "session-uuid",
-  "result_text": "API Error: Rate limit reached",
-  "error": "rate_limit",
-  "error_details": "429 Too Many Requests"
-}
-```
-
-### `notification`
-Direction: `from_worker`
-```json
-{"text": "Claude emitted a notification."}
-```
-
----
-
-## I-5: Hook Contract
-
-Hooks are command hooks implemented as direct Python entrypoints.
-
-### Shared environment
-
-| Variable | Description |
+| Resource | URI |
 |---|---|
-| `SINGLETON_THREAD_ID` | Durable parent thread |
-| `SINGLETON_RUN_ID` | Current run id |
-| `SINGLETON_DB_PATH` | Absolute path to `messages.db` |
-| `SINGLETON_STATE_DIR` | Absolute path to `~/.singleton/` |
+| root | `singleton-root://` |
+| host | `singleton-host:/<host_id>` |
+| workspace | `singleton-workspace:/<workspace_id>` |
+| session | `singleton-session:/<session_id>` |
+| chat | `singleton-chat:/<chat_id>` |
+| turn | `singleton-turn:/<turn_id>` |
+| request | `singleton-request:/<request_id>` |
+| changeset | `singleton-changeset:/<changeset_id>` |
+| terminal | `singleton-terminal:/<terminal_id>` |
+| artifact | `singleton-artifact:/<artifact_id>` |
 
-### `SessionStart`
-- Trigger: worker session startup or resume
-- Responsibility: append `run_started`
-- Uses hook stdin `session_id` and `source`
-- Exit: `0`
-
-### `PermissionRequest`
-- Trigger: Claude is about to show a permission dialog
-- Responsibility:
-  1. append `permission_request`
-  2. poll SQLite for a matching `permission_resolution`
-  3. return Claude-compatible allow/deny JSON
-- Deny responses may include a freeform `reason`
-
-### `Stop`
-- Trigger: Claude completed the turn successfully
-- Responsibility: append `run_finished` with `outcome="completed"`
-- Uses `session_id` and `last_assistant_message`
-
-### `StopFailure`
-- Trigger: Claude ended due to API error
-- Responsibility: append `run_finished` with `outcome="api_error"`
-- Uses `session_id`, `error`, `error_details`, and `last_assistant_message`
-
-### `Notification`
-- Optional; append `notification`
+Ids must be stable across daemon restarts. Prefer UUIDv7 or another
+time-sortable random id format during implementation.
 
 ---
 
-## I-6: Worker Spawn Interface
+## 3. Core Rust Traits
 
-Each worker run is a fresh subprocess.
+These traits are conceptual contracts. Exact signatures can change during the
+Rust spike to fit chosen crates, but the boundaries should remain.
 
-```python
-cmd = [
-    "claude",
-    "-p",
-    "--output-format=stream-json",
-    "--verbose",
-    "--settings", settings_json,
-    *( ["--resume", session_id] if session_id else [] ),
-    prompt_text,
-]
+### 3.1 Control surface
+
+```rust
+#[async_trait::async_trait]
+pub trait ControlSurface {
+    async fn serve(&self, broker: BrokerHandle) -> Result<(), SingletonError>;
+}
 ```
 
-Notes:
-- exact Claude flags may be refined during implementation, but the process model is one request per subprocess
-- `run_id` must exist before spawn
-- hook environment must include `SINGLETON_THREAD_ID` and `SINGLETON_RUN_ID`
-- stdout and stderr are streamed to `{run_id}.stdout.jsonl` and `{run_id}.stderr.jsonl`
+First implementation: `McpControlSurface`.
 
----
+Future optional implementation: `AhpControlSurface` for downstream clients
+that want AHP-style resource subscriptions.
 
-## I-7: Hub Spawn Interface
+### 3.2 Host connector
 
-The hub is daemon-owned and long-lived.
+```rust
+#[async_trait::async_trait]
+pub trait HostConnector {
+    async fn connect(&self, config: HostConfig) -> Result<Box<dyn HostConnection>, SingletonError>;
+}
 
-```python
-cmd = [
-    "claude",
-    "-p",
-    "--output-format=stream-json",
-    "--verbose",
-]
+#[async_trait::async_trait]
+pub trait HostConnection: Send + Sync {
+    fn host_id(&self) -> HostId;
+    fn capabilities(&self) -> HostCapabilities;
+    async fn ensure_workspace(&self, spec: WorkspaceSpec) -> Result<Workspace, SingletonError>;
+    async fn close_workspace(&self, id: WorkspaceId, disposition: CloseDisposition, force: bool) -> Result<CleanupSummary, SingletonError>;
+}
 ```
 
-The daemon writes prompts to hub stdin and consumes hub stdout in memory, then renders them via the singleton TUI.
+First implementation: `LocalHostConnector`.
 
-The hub working directory contains:
-- `.mcp.json` with the singleton MCP server
-- `.claude/settings.json` enabling that MCP server and pre-allowing singleton MCP tools
+Future implementations: `SshHostConnector`, cloud sandbox connectors,
+`AhpHostConnector`.
+
+### 3.3 Agent backend
+
+```rust
+#[async_trait::async_trait]
+pub trait AgentBackend: Send + Sync {
+    fn backend_id(&self) -> BackendId;
+    fn capabilities(&self) -> BackendCapabilities;
+
+    async fn create_session(&self, config: BackendSessionConfig) -> Result<BackendSession, SingletonError>;
+    async fn resume_session(&self, id: BackendSessionId) -> Result<BackendSession, SingletonError>;
+    async fn send_message(&self, session: &BackendSession, message: BackendMessage) -> Result<BackendTurn, SingletonError>;
+    async fn cancel_turn(&self, session: &BackendSession, turn: BackendTurnId) -> Result<(), SingletonError>;
+    fn events(&self, session: &BackendSession) -> BackendEventStream;
+}
+```
+
+First real backend: GitHub Copilot SDK.
+
+Required test backend: deterministic fake backend.
 
 ---
 
-## I-8: TUI Ownership Rules
+## 4. MCP Default Tool Contracts
 
-- There is one canonical daemon-owned app state
-- Each attached client has its own renderer state, including terminal dimensions
-- Exactly one client owns freeform hub input
-- Non-owning clients may observe all rendered state but may not type into the hub until they take control
-- Passthrough approvals route to the current owner first
+All tools return typed JSON objects. Errors should be explicit MCP errors with
+machine-readable codes and human-readable messages.
+
+### 4.1 `get_capabilities`
+
+Purpose: compact discovery for foreground agents.
+
+Input:
+
+```json
+{}
+```
+
+Output:
+
+```json
+{
+  "protocol_version": "0.1",
+  "default_profile": "mvp",
+  "hosts": [
+    {
+      "host_id": "host_local",
+      "kind": "local",
+      "status": "available",
+      "workspace_providers": ["local_path", "git_worktree", "backend_default"],
+      "agent_backends": ["copilot"]
+    }
+  ],
+  "backends": [
+    {
+      "backend_id": "copilot",
+      "display_name": "GitHub Copilot",
+      "supports_resume": true,
+      "supports_cancel": true,
+      "supports_permissions": true
+    }
+  ],
+  "limits": {
+    "max_event_limit": 500,
+    "max_wait_ms": 30000
+  }
+}
+```
+
+### 4.2 `get_inbox`
+
+Purpose: fan in all actionable session-management items.
+
+Input:
+
+```json
+{
+  "filter": {
+    "session_ids": ["sess_..."],
+    "kinds": ["permission_request", "input_request", "failed_turn", "completed_turn", "stale_session"],
+    "unread_only": true
+  }
+}
+```
+
+Output:
+
+```json
+{
+  "counts": {
+    "permission_request": 1,
+    "input_request": 0,
+    "failed_turn": 0,
+    "completed_turn": 2,
+    "stale_session": 0
+  },
+  "items": [
+    {
+      "kind": "permission_request",
+      "request_id": "req_...",
+      "session_id": "sess_...",
+      "turn_id": "turn_...",
+      "summary": "Allow command `cargo test --workspace --all-targets`?",
+      "created_at": "2026-01-01T00:00:00Z"
+    }
+  ]
+}
+```
+
+Inbox items must be concise. Detailed payloads should be read with
+`get_session` or `read_events`.
+
+### 4.3 `ensure_workspace`
+
+Purpose: create or resolve a workspace.
+
+Input:
+
+```json
+{
+  "spec": {
+    "kind": "git_worktree",
+    "repo": "/path/to/repo",
+    "base_ref": "main",
+    "branch": "topic-branch",
+    "create_branch": true,
+    "worktree_path_hint": "/path/to/worktrees/topic",
+    "host_id": "host_local",
+    "cleanup_policy": "keep"
+  }
+}
+```
+
+Supported `spec.kind` values:
+
+- `existing_workspace`
+- `local_path`
+- `git_worktree`
+- `backend_default`
+
+Output:
+
+```json
+{
+  "workspace_id": "work_...",
+  "resource_uri": "singleton-workspace:/work_...",
+  "status": "ready",
+  "host_id": "host_local",
+  "path": "/path/to/worktree",
+  "repo": {
+    "root": "/path/to/repo",
+    "base_ref": "main",
+    "branch": "topic-branch"
+  }
+}
+```
+
+### 4.4 `create_session`
+
+Purpose: create a durable background session.
+
+Input:
+
+```json
+{
+  "description": "Implement parser tests",
+  "backend": "copilot",
+  "workspace": {
+    "kind": "git_worktree",
+    "repo": "/path/to/repo",
+    "base_ref": "main",
+    "cleanup_policy": "delete_on_success"
+  },
+  "model": "auto",
+  "mode": "autopilot",
+  "permissions": {
+    "default": "ask"
+  },
+  "labels": ["parser", "tests"]
+}
+```
+
+Output:
+
+```json
+{
+  "session_id": "sess_...",
+  "resource_uri": "singleton-session:/sess_...",
+  "workspace_id": "work_...",
+  "status": "idle",
+  "event_cursor": "42"
+}
+```
+
+If `workspace` is inline, it must be resolved through the same path as
+`ensure_workspace`.
+
+### 4.5 `send_message`
+
+Purpose: enqueue/start an asynchronous turn.
+
+Input:
+
+```json
+{
+  "session_id": "sess_...",
+  "message": "Add tests for invalid parser inputs.",
+  "mode": "autopilot",
+  "workspace_override": null
+}
+```
+
+Output:
+
+```json
+{
+  "turn_id": "turn_...",
+  "resource_uri": "singleton-turn:/turn_...",
+  "status": "running",
+  "event_cursor": "43"
+}
+```
+
+The primitive is asynchronous. Foreground agents should poll or long-poll with
+`read_events`.
+
+### 4.6 `read_events`
+
+Purpose: read sequence-numbered events for any resource.
+
+Input:
+
+```json
+{
+  "target": {
+    "session_id": "sess_..."
+  },
+  "cursor": "43",
+  "limit": 100,
+  "event_types": ["turn.started", "message.delta", "turn.completed"],
+  "wait_ms": 30000
+}
+```
+
+Output:
+
+```json
+{
+  "events": [
+    {
+      "event_id": "evt_...",
+      "server_seq": 44,
+      "resource_uri": "singleton-turn:/turn_...",
+      "parent_resource_uri": "singleton-session:/sess_...",
+      "event_type": "turn.completed",
+      "origin_kind": "backend",
+      "origin_id": "copilot",
+      "payload": {
+        "summary": "Added parser tests."
+      },
+      "created_at": "2026-01-01T00:00:00Z"
+    }
+  ],
+  "next_cursor": "44",
+  "timed_out": false
+}
+```
+
+`wait_ms` replaces a separate wait tool.
+
+### 4.7 `list_sessions`
+
+Purpose: recover coordination state after context loss.
+
+Input:
+
+```json
+{
+  "filter": {
+    "statuses": ["idle", "running", "needs_input"],
+    "labels": ["parser"],
+    "workspace_id": "work_..."
+  },
+  "limit": 50
+}
+```
+
+Output:
+
+```json
+{
+  "sessions": [
+    {
+      "session_id": "sess_...",
+      "title": "Parser tests",
+      "status": "running",
+      "workspace_id": "work_...",
+      "backend": "copilot",
+      "latest_event_cursor": "44",
+      "needs_input": false
+    }
+  ]
+}
+```
+
+### 4.8 `get_session`
+
+Purpose: inspect one session.
+
+Input:
+
+```json
+{
+  "session_id": "sess_..."
+}
+```
+
+Output:
+
+```json
+{
+  "session_id": "sess_...",
+  "resource_uri": "singleton-session:/sess_...",
+  "status": "idle",
+  "backend": {
+    "backend_id": "copilot",
+    "backend_session_id": "opaque-provider-id"
+  },
+  "workspace": {
+    "workspace_id": "work_...",
+    "path": "/path/to/worktree",
+    "branch": "topic-branch"
+  },
+  "active_turn": null,
+  "latest_event_cursor": "44",
+  "pending_requests": []
+}
+```
+
+### 4.9 `resolve_request`
+
+Purpose: resolve permission, input, or elicitation requests.
+
+Input:
+
+```json
+{
+  "request_id": "req_...",
+  "decision": "approve",
+  "response": {
+    "scope": "once"
+  },
+  "reason": null
+}
+```
+
+Supported decisions:
+
+- `approve`
+- `deny`
+- `respond`
+- `cancel`
+
+Output:
+
+```json
+{
+  "resolved": true,
+  "request_id": "req_...",
+  "status": "resolved"
+}
+```
+
+### 4.10 `cancel_turn`
+
+Purpose: cancel a running turn.
+
+Input:
+
+```json
+{
+  "session_id": "sess_...",
+  "turn_id": "turn_..."
+}
+```
+
+If `turn_id` is omitted, the active turn for the session is cancelled.
+
+Output:
+
+```json
+{
+  "cancelled": true,
+  "turn_id": "turn_..."
+}
+```
+
+### 4.11 `close_resource`
+
+Purpose: archive, dispose, or delete sessions and workspaces.
+
+Input:
+
+```json
+{
+  "target": {
+    "workspace_id": "work_..."
+  },
+  "disposition": "delete",
+  "force": false
+}
+```
+
+Supported dispositions:
+
+- `archive`
+- `dispose`
+- `delete`
+
+Output:
+
+```json
+{
+  "closed": true,
+  "target_uri": "singleton-workspace:/work_...",
+  "cleanup_summary": {
+    "deleted_paths": ["/path/to/worktree"],
+    "skipped": []
+  }
+}
+```
+
+Rules:
+
+- closing a session never implicitly deletes a workspace unless the workspace
+  cleanup policy permits it
+- deleting a workspace with active sessions fails unless `force=true`
+- repeated calls are safe and idempotent
 
 ---
 
-## Interface Dependency Summary
+## 5. Persistent Store Interfaces
 
-| Interface | Producer | Consumer |
-|---|---|---|
-| I-1 Unix socket protocol | CLI, Daemon | CLI, Daemon |
-| I-2 MCP tools | Daemon | Hub |
-| I-3 SQLite schema | Daemon, hooks | Daemon, hooks, MCP layer |
-| I-4 Durable messages | Hooks, daemon | Daemon, hooks, MCP layer |
-| I-5 Hook contract | Claude Code, daemon | Python hook entrypoints |
-| I-6 Worker spawn | Worker session manager | Claude CLI |
-| I-7 Hub spawn | Hub controller | Claude CLI |
-| I-8 TUI ownership | Daemon | Attached clients |
+The store should expose repositories rather than raw SQL from business logic.
+
+Required repository capabilities:
+
+- allocate stable ids and resource URIs
+- insert singleton intents before backend calls
+- append events with monotonically increasing `server_seq`
+- read events by resource and cursor
+- create and update hosts/workspaces/sessions/chats/turns/requests
+- resolve requests atomically
+- mark sessions degraded when backend resume fails
+- archive/dispose/delete resources with idempotent semantics
+
+Large payloads may be stored in JSONL/blob files referenced from SQLite, but
+the event row must retain enough metadata for filtering and cursoring.
+
+---
+
+## 6. Event Types
+
+Event type names should be stable, dot-separated, and resource-oriented.
+
+Initial categories:
+
+- `host.available`
+- `host.unavailable`
+- `workspace.created`
+- `workspace.ready`
+- `workspace.closed`
+- `workspace.changeset.created`
+- `session.created`
+- `session.resumed`
+- `session.status_changed`
+- `session.archived`
+- `turn.queued`
+- `turn.started`
+- `turn.completed`
+- `turn.failed`
+- `turn.cancelled`
+- `message.delta`
+- `message.completed`
+- `request.created`
+- `request.resolved`
+- `backend.event`
+- `backend.error`
+
+Backend-specific payloads must stay in `payload_json`; do not leak
+provider-native ids into public ids except inside explicit backend metadata.
+
+---
+
+## 7. CLI Interface
+
+The CLI is secondary and should be thin.
+
+Initial commands:
+
+```bash
+singleton serve
+singleton status
+singleton stop
+```
+
+Optional later commands:
+
+```bash
+singleton attach <session_id>
+singleton export <resource_uri>
+singleton doctor
+```
+
+The CLI must call the same broker APIs as MCP tools whenever possible.
+
+---
+
+## 8. Compatibility and Migration
+
+The previous Python daemon, hub, worker, hook, and TUI interfaces are
+historical reference only. New work should not extend those contracts except to
+mine tests, examples, or behavior notes during the Rust rewrite.
+
+The repository may temporarily contain both Python and Rust code while the
+replacement lands. During that period, docs must clearly identify which
+interfaces are current and which are superseded.

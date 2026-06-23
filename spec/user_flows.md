@@ -1,178 +1,265 @@
 # singleton - User Flows
 
-## UF-1: First-time setup
+## 1. Foreground Agent as Coordinator
 
-**Actor**: User who has just cloned the repo.
+### Goal
 
-1. User runs `./setup.sh`
-2. Setup installs dependencies and creates `~/.singleton/workers/default/`
-3. Setup ensures singleton runtime directories exist
-4. User runs `singleton`
-5. Daemon starts, hub launches, and the singleton TUI attaches
+A user asks their current foreground agent to coordinate multiple background
+agent sessions.
 
-**Outcome**: User is attached to the daemon-owned hub through the singleton TUI.
+### Flow
 
----
+1. Foreground agent calls `get_capabilities`.
+2. Foreground agent decides which tasks can run independently.
+3. Foreground agent creates one singleton session per independent task.
+4. Foreground agent sends each task with `send_message`.
+5. Foreground agent polls `read_events` and `get_inbox`.
+6. Foreground agent asks the user about approvals or ambiguous input when
+   needed.
+7. Foreground agent calls `resolve_request`.
+8. Foreground agent summarizes completed background work.
+9. Foreground agent closes completed sessions and temporary workspaces with
+   `close_resource`.
 
-## UF-2: Create a new supervised thread
+### Expected behavior
 
-**Actor**: User in the hub session.
-
-1. User asks the hub to create a worker thread
-2. Hub calls `create_thread(...)`
-3. Daemon persists thread metadata
-4. Hub confirms thread creation
-
-**Outcome**: Durable thread metadata exists, but no idle worker process is kept alive.
-
----
-
-## UF-3: Start work on a thread
-
-**Actor**: Hub agent delegating work.
-
-1. Hub calls `send_to_thread("abc123", "Refactor the auth module")`
-2. Daemon creates a `run` record first
-3. Daemon spawns a fresh worker subprocess, resuming with the thread's `session_id` if present
-4. `SessionStart` hook emits `run_started`
-5. Worker processes the request and eventually emits `run_finished` via `Stop` or `StopFailure`
-6. `send_to_thread` returns the terminal summary
-
-**Outcome**: One run is completed for the thread, and the thread remains resumable for future work.
+- Background sessions continue running while the foreground agent works on
+  other tasks.
+- The foreground agent can recover state after context loss with
+  `list_sessions`, `get_session`, and event cursors.
+- Long-running sessions do not block the MCP call that started them.
 
 ---
 
-## UF-4: Worker requests permission in supervised mode
+## 2. Fresh Git Worktree Task
 
-**Actor**: Worker run and hub.
+### Goal
 
-1. Worker hits a Claude permission boundary
-2. `PermissionRequest` hook writes a durable `permission_request` message into SQLite
-3. Daemon reflects the pending approval into hub/TUI state
-4. Hub agent decides to approve or deny via MCP
-5. Daemon writes `permission_resolution`
-6. Hook observes the resolution and returns the corresponding decision to Claude
+Run a background editing task in an isolated repo checkout.
 
-**Outcome**: The worker is supervised by the hub without requiring file-drop IPC.
+### Flow
 
----
+1. Foreground agent calls `create_session` with an inline `git_worktree`
+   workspace spec.
+2. Singleton creates a local worktree from the requested repo/base ref.
+3. Singleton creates the backend session with the worktree as default
+   workspace.
+4. Foreground agent calls `send_message` with the implementation prompt.
+5. Singleton persists the turn intent and dispatches it to the backend.
+6. Foreground agent calls `read_events` until the turn completes or requires
+   input.
+7. Foreground agent inspects the completion summary and workspace metadata.
+8. Foreground agent decides whether to keep or delete the worktree.
+9. Foreground agent calls `close_resource` for the session and, if appropriate,
+   the workspace.
 
-## UF-5: Worker requests permission in passthrough mode
+### Expected behavior
 
-**Actor**: Worker run and active attached user.
-
-1. Worker hits a Claude permission boundary
-2. `PermissionRequest` hook writes a durable `permission_request`
-3. Daemon routes the request to the active input owner in the TUI
-4. User approves or denies, optionally with a reason
-5. Daemon writes `permission_resolution`
-6. Hook returns that decision to Claude
-
-**Outcome**: Sensitive operations are decided directly by the user.
-
----
-
-## UF-6: Worker completes successfully
-
-**Actor**: Worker run that has finished.
-
-1. Worker completes the request
-2. `Stop` hook emits `run_finished` with `outcome="completed"`, `session_id`, and `last_assistant_message`
-3. Daemon updates thread/run metadata
-4. Hub and TUI show the summary
-
-**Outcome**: Completion is durable even if the daemon restarts shortly afterward.
+- The `create_session` response includes both `session_id` and resolved
+  `workspace_id`.
+- Workspace cleanup follows the workspace cleanup policy or explicit
+  `close_resource` request.
+- Deleting a workspace fails while active sessions still reference it unless
+  forced.
 
 ---
 
-## UF-7: Worker ends with API failure
+## 3. Shared Workspace Research
 
-**Actor**: Worker run affected by an API-level error.
+### Goal
 
-1. Claude ends with an API error
-2. `StopFailure` hook emits `run_finished` with `outcome="api_error"`
-3. Daemon surfaces the failure to hub/TUI state
-4. Hub may retry or ask the user what to do next
+Run several read-only research sessions against one shared checkout.
 
-**Outcome**: API failures are first-class terminal run events.
+### Flow
 
----
+1. Foreground agent calls `ensure_workspace` with a git worktree or local path.
+2. Singleton returns a reusable `workspace_id`.
+3. Foreground agent calls `create_session` multiple times with
+   `existing_workspace`.
+4. Foreground agent dispatches research prompts with `send_message`.
+5. Foreground agent periodically calls `read_events` for each session cursor.
+6. Foreground agent aggregates findings.
+7. Foreground agent archives sessions with `close_resource`.
+8. Foreground agent keeps or deletes the shared workspace explicitly.
 
-## UF-8: Hub inspects worker artifacts
+### Expected behavior
 
-**Actor**: Hub agent reviewing worker output.
-
-1. Hub calls `thread_output("abc123", page=0, page_size=50)`
-2. Receives recent JSONL-derived output lines
-3. If needed, hub calls `get_thread_events("abc123")` for durable lifecycle events
-
-**Outcome**: Hub can inspect detail without flooding its context by default.
-
----
-
-## UF-9: Follow up on a prior thread
-
-**Actor**: Hub agent continuing work.
-
-1. Thread `abc123` already has a `session_id`
-2. Hub calls `send_to_thread("abc123", "Also update the README")`
-3. Daemon creates a new run and spawns `claude -p --resume <session_id>`
-4. Worker completes and updates the thread's latest `session_id` if needed
-
-**Outcome**: Thread continuity is preserved without long-lived idle workers.
+- Shared workspace use is explicit.
+- Editing tasks should not silently share a workspace unless the foreground
+  agent requests it.
+- Session closure does not remove the shared workspace by default.
 
 ---
 
-## UF-10: User detaches and re-attaches
+## 4. Inbox Fan-In
 
-**Actor**: User stepping away temporarily.
+### Goal
 
-1. User presses `Ctrl+b d`
-2. The current client detaches
-3. Daemon and hub continue running
-4. Later the user runs `singleton attach`
-5. The daemon sends the current view model to the new client
+Find all background sessions that need attention.
 
-**Outcome**: Clients are ephemeral; daemon state persists.
+### Flow
 
----
+1. Foreground agent calls `get_inbox`.
+2. Singleton returns counts and compact actionable items.
+3. Foreground agent handles items by kind:
+   - permission request: ask the user or apply policy, then call
+     `resolve_request`
+   - input request: collect an answer, then call `resolve_request`
+   - failed turn: inspect session/events and optionally retry
+   - completed turn: read final events and summarize
+   - stale session: inspect or close the session
+4. Foreground agent repeats until there are no blocking items.
 
-## UF-11: Multi-attach with ownership handoff
+### Expected behavior
 
-**Actor**: User with two terminals.
-
-1. Terminal A is attached and owns hub input
-2. Terminal B runs `singleton attach`
-3. Both terminals render the same app state
-4. Terminal B attempts to type into the hub and is blocked until it takes control
-5. Terminal B issues a control handoff command
-6. Daemon grants ownership to Terminal B
-
-**Outcome**: Multi-attach is supported without ambiguous concurrent hub input.
+- `get_inbox` is concise enough to call often.
+- It does not return large transcripts or diffs.
+- Inbox items include ids needed for follow-up tools.
 
 ---
 
-## UF-12: Daemon crashes while a worker run continues
+## 5. Permission or Input Resolution
 
-**Actor**: System under failure.
+### Goal
 
-1. A worker run is active
-2. Daemon crashes
-3. Hub is lost, but the worker subprocess continues
-4. Worker hooks continue writing lifecycle and permission messages into SQLite
-5. User restarts `singleton`
-6. Daemon rebuilds state from SQLite and resumes managing unresolved worker activity
+Let background sessions request human or foreground-agent decisions without
+owning the foreground conversation.
 
-**Outcome**: Real work survives daemon failure.
+### Flow
+
+1. Backend emits a permission/input/elicitation request.
+2. Singleton stores the request and appends `request.created`.
+3. Request appears in `get_inbox`.
+4. Foreground agent decides whether it can resolve directly.
+5. If needed, foreground agent asks the user in its own UI.
+6. Foreground agent calls `resolve_request` with approval, denial, response, or
+   cancellation.
+7. Singleton records `request.resolved` and forwards the result to the backend.
+
+### Expected behavior
+
+- Requests are durable across daemon restarts.
+- Resolution is atomic and idempotent.
+- Denials carry a reason when useful.
+- Singleton does not invent human approval; the foreground agent or user makes
+  that decision.
 
 ---
 
-## UF-13: Default worker configuration
+## 6. Resume After Foreground Context Loss
 
-**Actor**: User who wants shared worker defaults.
+### Goal
 
-1. User creates `~/.singleton/workers/default/.claude/settings.json`
-2. Threads created without an explicit `cwd` use that directory
-3. Worker runs inherit those Claude Code defaults plus singleton-injected hooks
+A foreground agent loses context or a user starts a new foreground session, but
+background sessions continue.
 
-**Outcome**: Worker defaults remain user-configurable without mutating per-project settings.
+### Flow
+
+1. New foreground agent calls `get_capabilities`.
+2. It calls `get_inbox` for actionable state.
+3. It calls `list_sessions` for active/recent sessions.
+4. It calls `get_session` for sessions it wants to resume coordinating.
+5. It uses each session's latest cursor to call `read_events`.
+6. It continues coordination from durable singleton state.
+
+### Expected behavior
+
+- No singleton-owned hub transcript is required for recovery.
+- Event cursors and summaries provide enough state for a new foreground agent
+  to resume orchestration.
+- Backend transcripts remain backend-owned.
+
+---
+
+## 7. Cancel a Running Turn
+
+### Goal
+
+Stop a runaway or obsolete background turn.
+
+### Flow
+
+1. Foreground agent sees a running turn through `get_session`, `read_events`, or
+   `get_inbox`.
+2. Foreground agent calls `cancel_turn`.
+3. Singleton records the cancellation request.
+4. Singleton forwards cancellation to the backend.
+5. Backend confirms cancellation or reports failure.
+6. Singleton appends `turn.cancelled` or `turn.failed`.
+
+### Expected behavior
+
+- Cancellation is best-effort when backend support is limited.
+- Cancelled turns remain visible in history.
+- Session can accept later turns unless backend marks it broken.
+
+---
+
+## 8. Session and Workspace Cleanup
+
+### Goal
+
+Safely close long-lived resources.
+
+### Flow
+
+1. Foreground agent calls `close_resource` for completed sessions.
+2. Singleton archives or disposes the backend session according to disposition.
+3. Foreground agent calls `close_resource` for disposable workspaces.
+4. Singleton checks active references.
+5. Singleton deletes paths only when policy and active references allow it.
+6. Singleton returns a cleanup summary.
+
+### Expected behavior
+
+- Cleanup calls are idempotent.
+- Workspace deletion is never an accidental side effect of session closure.
+- Forced deletion is explicit and auditable.
+
+---
+
+## 9. Future Remote Host Flow
+
+### Goal
+
+Run a session on another host while keeping the same MCP control surface.
+
+### Flow
+
+1. Foreground agent calls `get_capabilities` and sees remote host support.
+2. Foreground agent calls `ensure_workspace` with a host id and repo/worktree
+   spec.
+3. Singleton connects to the host through a host connector.
+4. Host connector provisions the workspace.
+5. Foreground agent creates a session using that workspace.
+6. Events, requests, and changesets are normalized into singleton's store.
+
+### Expected behavior
+
+- The MCP tools do not change when host placement changes.
+- Host connectors advertise capabilities and limitations.
+- Secrets are referenced through host/provider config, not stored raw in
+  singleton's SQLite database.
+
+---
+
+## 10. Future AHP Host Connector Flow
+
+### Goal
+
+Federate an external AHP-speaking host into singleton.
+
+### Flow
+
+1. Singleton connects to an AHP host as a client.
+2. It subscribes to root/session/chat/terminal/changeset channels.
+3. It receives snapshots and ordered action streams.
+4. It maps AHP resources to singleton hosts, workspaces, sessions, chats,
+   turns, requests, terminals, and changesets.
+5. Foreground agents keep using the same singleton MCP tools.
+
+### Expected behavior
+
+- AHP is isolated behind a connector.
+- Singleton core does not require AHP crates or protocol types.
+- Sequence/replay concepts align with singleton event cursors.
