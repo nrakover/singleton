@@ -119,13 +119,14 @@ AHP hosts. A downstream AHP server surface may be evaluated later.
 
 ## Proposed Rust Workspace
 
-Likely crate layout:
+Current crate layout:
 
 - `crates/singleton-core`
 - `crates/singleton-store`
 - `crates/singleton-copilot`
 - `crates/singleton-mcp`
 - `crates/singleton-host`
+- `crates/singleton-broker`
 - `crates/singleton-cli`
 - `crates/singleton-test-support`
 
@@ -186,6 +187,8 @@ cargo test --workspace --features live-copilot -- --ignored
 - document coordinator prompts for MCP-capable foreground agents
 - add examples for parallel research, isolated worktree tasks, inbox handling,
   approvals, cancellation, and cleanup
+
+Current artifact: `docs/foreground-agent-coordination.md`.
 
 ### Phase 4: remote/backend fast follow
 

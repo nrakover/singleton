@@ -65,17 +65,31 @@ runtime dependency.
 
 ## Development status
 
-The repository is in a design reset. See:
+The repository now contains the first Rust broker slice: a Cargo workspace,
+SQLite store, local host/worktree connector, fake backend, rmcp-backed MCP tool
+surface, Copilot SDK adapter, and thin CLI. See:
 
 - `spec/spec.md`
 - `spec/interfaces.md`
 - `spec/user_flows.md`
 - `spec/tests.md`
 - `project_tasks/2_agent-session-mcp-pivot.md`
+- `docs/foreground-agent-coordination.md`
 - `AGENTS.md`
 
 The old Python code, tests, hook scripts, and slash-command docs remain for
 reference until the Rust replacement is implemented.
+
+## CLI smoke usage
+
+```bash
+cargo +1.94.0 run -p singleton-cli --bin singleton -- serve --once
+cargo +1.94.0 run -p singleton-cli --bin singleton -- serve --stdio
+cargo +1.94.0 run -p singleton-cli --bin singleton -- status
+```
+
+`serve --stdio` exposes the default singleton MCP tools over stdio using
+`rmcp`.
 
 ## Planned verification
 
