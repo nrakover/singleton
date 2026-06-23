@@ -75,6 +75,7 @@ surface, Copilot SDK adapter, and thin CLI. See:
 - `spec/tests.md`
 - `project_tasks/2_agent-session-mcp-pivot.md`
 - `docs/foreground-agent-coordination.md`
+- `docs/remote-host-fast-follow.md`
 - `AGENTS.md`
 
 The old Python code, tests, hook scripts, and slash-command docs remain for

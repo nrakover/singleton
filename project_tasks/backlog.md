@@ -28,8 +28,8 @@ Purpose: curated follow-up work for the Rust MCP session broker pivot.
 
 ## Remote hosts
 
-- Define host runner protocol with reconnect/replay semantics.
-- Implement SSH host connector.
+- Extend the initial `RemoteRunner`/`SshHostConnector` scaffold into a full
+  remote session runner with reconnect/replay semantics.
 - Evaluate cloud sandbox providers such as GitHub-hosted sessions or Daytona.
 - Support repo-homed workspaces on remote hosts.
 

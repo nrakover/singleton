@@ -197,6 +197,12 @@ Current artifact: `docs/foreground-agent-coordination.md`.
 - evaluate cloud sandbox providers
 - evaluate `AhpHostConnector` once AHP stabilizes enough for integration
 
+Current artifacts:
+
+- `singleton-host::RemoteRunner`
+- `singleton-host::SshHostConnector`
+- `docs/remote-host-fast-follow.md`
+
 ---
 
 ## Completion Checklist
