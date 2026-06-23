@@ -182,6 +182,27 @@ cargo test --workspace --features live-copilot -- --ignored
 - implement Copilot adapter vertical slice
 - implement CLI admin commands
 
+Current Phase 2 status:
+
+- `send_message` now persists turns and returns while backend dispatch continues
+  in a Tokio background task.
+- `AgentBackend::send_message` accepts a fallible broker event sink so fake and
+  Copilot backends can emit normalized events while a turn is running.
+- The Copilot adapter now supports real SDK event subscription ingestion and
+  store-backed permission, input, and elicitation handlers.
+- `resolve_request` stores both decision and response so backend handlers can
+  map singleton resolutions back to provider-specific responses.
+- `singleton serve --backend copilot --stdio` selects the real Copilot backend;
+  fake remains available for deterministic tests and local smoke checks.
+- Broker startup reconciles persisted queued/running turns as interrupted so a
+  restarted local broker does not leave stale active turns.
+- CLI stdio integration test covers MCP initialize, tool discovery, create
+  session, async send, and event polling through the fake backend.
+- Ignored live Copilot smoke covers real SDK session creation plus send/event
+  completion when run with `--features live-copilot -- --ignored`.
+- Ignored live CLI smoke covers `singleton serve --backend copilot --stdio`
+  through MCP initialize/create/send/read-events.
+
 ### Phase 3: hub convention docs
 
 - document coordinator prompts for MCP-capable foreground agents
@@ -214,4 +235,7 @@ Current artifacts:
 - fake backend supports deterministic end-to-end tests
 - local git worktree lifecycle is tested
 - Copilot adapter has opt-in live tests
+- CLI can select fake or Copilot backend
+- CLI stdio MCP integration test exists
+- live Copilot stdio MCP integration test exists
 - full Rust validation gate passes

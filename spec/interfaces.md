@@ -83,20 +83,27 @@ Future implementations: `SshHostConnector`, cloud sandbox connectors,
 ```rust
 #[async_trait::async_trait]
 pub trait AgentBackend: Send + Sync {
-    fn backend_id(&self) -> BackendId;
     fn capabilities(&self) -> BackendCapabilities;
 
     async fn create_session(&self, config: BackendSessionConfig) -> Result<BackendSession, SingletonError>;
     async fn resume_session(&self, id: BackendSessionId) -> Result<BackendSession, SingletonError>;
-    async fn send_message(&self, session: &BackendSession, message: BackendMessage) -> Result<BackendTurn, SingletonError>;
+    async fn send_message(
+        &self,
+        session: &BackendSession,
+        message: BackendMessage,
+        event_sink: BackendEventSink,
+    ) -> Result<BackendTurn, SingletonError>;
     async fn cancel_turn(&self, session: &BackendSession, turn: BackendTurnId) -> Result<(), SingletonError>;
-    fn events(&self, session: &BackendSession) -> BackendEventStream;
 }
 ```
 
 First real backend: GitHub Copilot SDK.
 
 Required test backend: deterministic fake backend.
+
+`BackendEventSink` is a fallible callback owned by the broker. Backends use it
+to emit normalized progress, output, permission, input, and lifecycle events
+while `send_message` is running in a broker-spawned background task.
 
 ---
 
@@ -296,12 +303,14 @@ Output:
   "turn_id": "turn_...",
   "resource_uri": "singleton-turn:/turn_...",
   "status": "running",
-  "event_cursor": "43"
+  "event_cursor": 43
 }
 ```
 
 The primitive is asynchronous. Foreground agents should poll or long-poll with
-`read_events`.
+`read_events`. A successful call means the turn was durably recorded and
+dispatch was started; completion/failure/needs-input is observed later via
+events, `get_session`, or `get_inbox`.
 
 ### 4.6 `read_events`
 
@@ -314,12 +323,16 @@ Input:
   "target": {
     "session_id": "sess_..."
   },
-  "cursor": "43",
+  "cursor": 43,
   "limit": 100,
   "event_types": ["turn.started", "message.delta", "turn.completed"],
   "wait_ms": 30000
 }
 ```
+
+When targeting a session, implementations must include both exact session
+events and child events whose `parent_resource_uri` is that session, including
+turn and request events.
 
 Output:
 
@@ -340,7 +353,7 @@ Output:
       "created_at": "2026-01-01T00:00:00Z"
     }
   ],
-  "next_cursor": "44",
+  "next_cursor": 44,
   "timed_out": false
 }
 ```
@@ -439,6 +452,10 @@ Supported decisions:
 - `deny`
 - `respond`
 - `cancel`
+
+The stored request resolution must retain both the decision and optional
+response payload so backend handlers can map singleton decisions back to
+provider-specific permission, input, or elicitation responses.
 
 Output:
 
@@ -579,6 +596,7 @@ Initial commands:
 
 ```bash
 singleton serve
+singleton serve --backend copilot --stdio
 singleton status
 singleton stop
 ```

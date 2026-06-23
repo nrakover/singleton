@@ -115,8 +115,10 @@ Default tests:
 Ignored live tests:
 
 - create a real Copilot session
-- resume a real session
 - send a message and stream events
+- drive `singleton serve --backend copilot --stdio` over MCP initialize,
+  create-session, send-message, and read-events
+- resume a real session
 - cancel a running turn when supported
 - surface and resolve a permission request
 
@@ -146,9 +148,14 @@ Crate: `singleton-cli`
 
 Coverage:
 
-- `singleton serve` starts the broker with expected config
+- `singleton serve --backend fake --stdio` starts a JSON-RPC MCP server
+- `singleton serve --backend copilot` selects the Copilot backend
+- ignored live test validates `singleton serve --backend copilot --stdio`
+  through the MCP wire protocol
 - `singleton status` reads broker state
 - `singleton stop` requests shutdown
+- stdio `initialize`, `tools/list`, and `tools/call` work against the fake
+  backend for a create/send/read-events vertical slice
 - CLI output is human-readable and stable enough for smoke tests
 
 CLI tests should avoid depending on long-running external services.
@@ -187,7 +194,9 @@ These scenarios should run with fake backend and temporary local workspaces.
 3. Drop broker instance.
 4. Reopen broker with the same SQLite database.
 5. Assert `list_sessions`, `get_session`, and `read_events` recover state.
-6. Fake backend resume succeeds.
+6. Queued/running turns from the previous broker process are marked failed and
+   unread with an interrupted/retryable event unless the backend can reattach
+   them explicitly in a future enhancement.
 
 ### 3.4 Backend state missing
 

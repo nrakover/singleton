@@ -15,6 +15,10 @@ Primary references:
 - `spec/tests.md`
 - `project_tasks/2_agent-session-mcp-pivot.md`
 
+Copilot CLI/app is the working environment going forward. Legacy Claude Code
+artifacts may be useful for historical context, but they are not authoritative
+and should not be kept in sync.
+
 ## Verification Commands
 
 For Rust implementation work, run all before marking a task complete:
@@ -93,7 +97,6 @@ When changing behavior, update all relevant current artifacts:
 3. `spec/user_flows.md` if user-visible flows change
 4. `spec/tests.md` if validation strategy or expected behavior changes
 5. `project_tasks/2_agent-session-mcp-pivot.md` or `project_tasks/backlog.md`
-6. `MEMORY.md` in the Claude project memory directory
 
 Do not extend the superseded Python hub/worker architecture unless the task is
 explicitly scoped as legacy maintenance.

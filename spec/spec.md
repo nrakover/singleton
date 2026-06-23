@@ -91,6 +91,8 @@ mapping and subagent/team patterns stay clean.
 A turn is one foreground request sent into a session/chat. Turns are
 asynchronous by default: `send_message` returns a `turn_id`, and the foreground
 agent observes progress through `read_events` or `get_inbox`.
+The broker persists the turn before dispatching it to the backend and then
+continues the backend call in a Tokio background task.
 
 ---
 
@@ -221,11 +223,17 @@ The MVP must validate:
 - create session
 - resume session
 - send message
-- subscribe to events
+- subscribe to events and normalize SDK events into singleton events
 - cancel/abort a turn
-- permission, elicitation, and input handlers
+- permission, elicitation, and input handlers backed by durable singleton
+  requests resolved through `resolve_request`
 - model/mode configuration
 - custom tools or MCP integration
+
+The current `AgentBackend` contract accepts a fallible event sink during
+`send_message`. Backends emit normalized `BackendEvent` values into that sink
+while the broker-owned background task remains responsible for terminal turn
+status reconciliation.
 
 ### 6.2 Host connector
 
@@ -269,7 +277,7 @@ Singleton's internal resources should be mappable to AHP concepts:
 Use SQLite for MVP state, with append-heavy event storage and explicit
 migrations.
 
-Likely tables:
+Current tables:
 
 - `hosts`
 - `workspaces`
@@ -296,6 +304,11 @@ Likely tables:
 
 This supports MCP polling immediately and future AHP-like replay/snapshot
 adapters later.
+
+`read_events(session_id=...)` must include events whose `resource_uri` is the
+session as well as child events whose `parent_resource_uri` is the session. This
+lets foreground agents poll one session cursor and still receive turn/request
+events.
 
 ---
 

@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+live-copilot = ["singleton-copilot/live-copilot"]
+
 [[bin]]
 name = "singleton"
 path = "src/main.rs"
@@ -13,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 singleton-broker = { path = "../singleton-broker" }
+singleton-copilot = { path = "../singleton-copilot" }
 singleton-core = { path = "../singleton-core" }
 singleton-host = { path = "../singleton-host" }
 singleton-mcp = { path = "../singleton-mcp" }
@@ -23,6 +28,7 @@ tracing-subscriber.workspace = true
 rmcp.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]

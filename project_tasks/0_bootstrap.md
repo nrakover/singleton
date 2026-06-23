@@ -132,6 +132,18 @@ current implementation target is the Rust MCP session broker in
 `project_tasks/2_agent-session-mcp-pivot.md`; new work should not extend these
 interfaces except for legacy maintenance or migration reference.
 
+Current Rust implementation details that supersede the sections below:
+
+- `singleton serve --backend fake|copilot --stdio` runs the MCP control surface.
+- `send_message` is durable and asynchronous: the broker records the turn,
+  spawns backend work in Tokio, and exposes progress through `read_events`.
+- The Copilot SDK adapter ingests subscription events and uses durable
+  singleton requests for permission, user-input, and elicitation callbacks.
+- `resolve_request` records both the decision and response payload so backend
+  handlers can answer provider callbacks correctly.
+- Broker startup marks persisted queued/running turns as interrupted instead of
+  leaving stale active turns after restart.
+
 ### stream-json turn format (workers)
 ```json
 {"type": "user", "message": {"role": "user", "content": "message text here"}}

@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::json;
 use singleton_core::{
-    AgentBackend, BackendCapabilities, BackendEvent, BackendMessage, BackendSession,
-    BackendSessionConfig, BackendSessionId, BackendTurn, BackendTurnId, FAKE_BACKEND_ID,
-    ResourceStatus, Result, SingletonError, new_id,
+    AgentBackend, BackendCapabilities, BackendEvent, BackendEventSink, BackendMessage,
+    BackendSession, BackendSessionConfig, BackendSessionId, BackendTurn, BackendTurnId,
+    FAKE_BACKEND_ID, ResourceStatus, Result, SingletonError, new_id,
 };
 
 #[derive(Debug, Clone)]
@@ -93,6 +93,7 @@ impl AgentBackend for FakeBackend {
         &self,
         _session: &BackendSession,
         message: BackendMessage,
+        event_sink: BackendEventSink,
     ) -> Result<BackendTurn> {
         let behavior = self
             .state
@@ -103,20 +104,20 @@ impl AgentBackend for FakeBackend {
             .unwrap_or_default();
         let backend_turn_id = new_id("fake_turn");
         let turn = match behavior {
-            FakeTurnBehavior::Complete { summary } => BackendTurn {
-                backend_turn_id,
-                status: ResourceStatus::Completed,
-                events: vec![
-                    BackendEvent {
-                        event_type: "message.delta".to_string(),
-                        payload: json!({ "content": format!("processed: {}", message.content) }),
-                    },
-                    BackendEvent {
+            FakeTurnBehavior::Complete { summary } => {
+                event_sink(BackendEvent {
+                    event_type: "message.delta".to_string(),
+                    payload: json!({ "content": format!("processed: {}", message.content) }),
+                })?;
+                BackendTurn {
+                    backend_turn_id,
+                    status: ResourceStatus::Completed,
+                    events: vec![BackendEvent {
                         event_type: "turn.completed".to_string(),
                         payload: json!({ "summary": summary }),
-                    },
-                ],
-            },
+                    }],
+                }
+            }
             FakeTurnBehavior::Fail { summary } => BackendTurn {
                 backend_turn_id,
                 status: ResourceStatus::Failed,
@@ -149,14 +150,17 @@ impl AgentBackend for FakeBackend {
                     }),
                 }],
             },
-            FakeTurnBehavior::StayRunning => BackendTurn {
-                backend_turn_id,
-                status: ResourceStatus::Running,
-                events: vec![BackendEvent {
+            FakeTurnBehavior::StayRunning => {
+                event_sink(BackendEvent {
                     event_type: "turn.started".to_string(),
                     payload: json!({ "summary": "fake turn still running" }),
-                }],
-            },
+                })?;
+                BackendTurn {
+                    backend_turn_id,
+                    status: ResourceStatus::Running,
+                    events: vec![],
+                }
+            }
         };
         Ok(turn)
     }
@@ -204,11 +208,12 @@ mod tests {
                     content: "hello".to_string(),
                     mode: None,
                 },
+                Arc::new(|_| Ok(())),
             )
             .await?;
 
         assert_eq!(turn.status, ResourceStatus::Completed);
-        assert_eq!(turn.events.len(), 2);
+        assert_eq!(turn.events.len(), 1);
         Ok(())
     }
 }

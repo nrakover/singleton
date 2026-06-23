@@ -1323,7 +1323,9 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "rmcp",
+ "serde_json",
  "singleton-broker",
+ "singleton-copilot",
  "singleton-core",
  "singleton-host",
  "singleton-mcp",
@@ -1342,6 +1344,7 @@ dependencies = [
  "github-copilot-sdk",
  "serde_json",
  "singleton-core",
+ "singleton-store",
  "tokio",
 ]
 

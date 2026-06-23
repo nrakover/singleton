@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -365,6 +367,8 @@ pub struct BackendTurn {
     pub events: Vec<BackendEvent>,
 }
 
+pub type BackendEventSink = Arc<dyn Fn(BackendEvent) -> Result<()> + Send + Sync>;
+
 #[async_trait]
 pub trait AgentBackend: Send + Sync {
     fn capabilities(&self) -> BackendCapabilities;
@@ -377,6 +381,7 @@ pub trait AgentBackend: Send + Sync {
         &self,
         session: &BackendSession,
         message: BackendMessage,
+        event_sink: BackendEventSink,
     ) -> Result<BackendTurn>;
 
     async fn cancel_turn(&self, session: &BackendSession, turn_id: BackendTurnId) -> Result<()>;

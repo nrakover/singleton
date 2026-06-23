@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::Value;
+use serde_json::{Value, json};
 use singleton_core::{
     BackendSessionId, CloseDisposition, Event, PendingRequest, RepoMetadata, RequestDecision,
     RequestKind, RequestStatus, ResourceKind, ResourceStatus, Result, Session, SessionId,
@@ -280,6 +280,28 @@ impl Store {
         row.try_into_session()
     }
 
+    pub fn get_session_by_backend_session_id(&self, backend_session_id: &str) -> Result<Session> {
+        let conn = self.conn.lock().map_err(|_| lock_err())?;
+        let row = conn
+            .query_row(
+                r#"
+                SELECT session_id, resource_uri, title, description, backend, backend_session_id,
+                       workspace_id, status, latest_event_cursor, labels_json, created_at, updated_at
+                FROM sessions
+                WHERE backend_session_id = ?1
+                "#,
+                params![backend_session_id],
+                session_row,
+            )
+            .optional()
+            .map_err(store_err)?
+            .ok_or_else(|| SingletonError::NotFound {
+                resource: "backend_session",
+                id: backend_session_id.to_string(),
+            })?;
+        row.try_into_session()
+    }
+
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
         let conn = self.conn.lock().map_err(|_| lock_err())?;
         let mut stmt = conn
@@ -534,6 +556,10 @@ impl Store {
                 RequestStatus::Resolved
             }
         };
+        let resolution = json!({
+            "decision": decision,
+            "response": response,
+        });
         let resolved_at = now_rfc3339();
         let conn = self.conn.lock().map_err(|_| lock_err())?;
         conn.execute(
@@ -545,7 +571,7 @@ impl Store {
             params![
                 request_id,
                 enum_to_string(&status)?,
-                opt_json(&response)?,
+                json_string(&resolution)?,
                 reason,
                 resolved_at
             ],
@@ -575,6 +601,52 @@ impl Store {
                 id: request_id.to_string(),
             })?;
         row.try_into_request()
+    }
+
+    pub fn unresolved_request_by_session_and_payload_key(
+        &self,
+        session_id: &str,
+        payload_key: &str,
+        payload_value: &str,
+    ) -> Result<Option<PendingRequest>> {
+        Ok(self.pending_requests()?.into_iter().find(|request| {
+            request.session_id == session_id
+                && request.payload.get(payload_key).and_then(Value::as_str) == Some(payload_value)
+        }))
+    }
+
+    pub fn mark_interrupted_turns(&self) -> Result<Vec<Turn>> {
+        let now = now_rfc3339();
+        let conn = self.conn.lock().map_err(|_| lock_err())?;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT turn_id, resource_uri, session_id, backend_turn_id, message, status, unread, created_at, updated_at
+                FROM turns
+                WHERE status IN ('queued', 'running')
+                ORDER BY created_at ASC
+                "#,
+            )
+            .map_err(store_err)?;
+        let mut rows = stmt.query([]).map_err(store_err)?;
+        let mut interrupted = Vec::new();
+        while let Some(row) = rows.next().map_err(store_err)? {
+            interrupted.push(turn_row(row).map_err(store_err)?.try_into_turn()?);
+        }
+        drop(rows);
+        drop(stmt);
+        for turn in &interrupted {
+            conn.execute(
+                r#"
+                UPDATE turns
+                SET status = 'failed', unread = 1, updated_at = ?2
+                WHERE turn_id = ?1 AND status IN ('queued', 'running')
+                "#,
+                params![turn.turn_id, now],
+            )
+            .map_err(store_err)?;
+        }
+        Ok(interrupted)
     }
 
     pub fn append_event(

@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use rmcp::ServiceExt;
 use singleton_broker::Broker;
-use singleton_core::{Result, SingletonError};
+use singleton_copilot::CopilotBackend;
+use singleton_core::{AgentBackend, Result, SingletonError};
 use singleton_host::LocalHostConnector;
 use singleton_mcp::SingletonMcpServer;
 use singleton_store::Store;
@@ -22,6 +23,8 @@ enum Command {
     Serve {
         #[arg(long)]
         database: Option<PathBuf>,
+        #[arg(long, value_enum, default_value = "fake")]
+        backend: BackendKind,
         #[arg(long)]
         once: bool,
         #[arg(long)]
@@ -34,6 +37,12 @@ enum Command {
     Stop,
 }
 
+#[derive(Clone, Debug, ValueEnum)]
+enum BackendKind {
+    Fake,
+    Copilot,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -44,9 +53,10 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Serve {
             database,
+            backend,
             once,
             stdio,
-        } => serve(database, once, stdio).await,
+        } => serve(database, backend, once, stdio).await,
         Command::Status { database } => status(database),
         Command::Stop => {
             println!(
@@ -57,9 +67,36 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn serve(database: Option<PathBuf>, once: bool, stdio: bool) -> Result<()> {
+async fn serve(
+    database: Option<PathBuf>,
+    backend: BackendKind,
+    once: bool,
+    stdio: bool,
+) -> Result<()> {
     let store = Store::open(resolve_database(database)?)?;
-    let broker = Broker::new(store, FakeBackend::new(), LocalHostConnector);
+    match backend {
+        BackendKind::Fake => {
+            run_broker(
+                Broker::new(store, FakeBackend::new(), LocalHostConnector),
+                once,
+                stdio,
+            )
+            .await
+        }
+        BackendKind::Copilot => {
+            let cwd = std::env::current_dir().map_err(|error| {
+                SingletonError::InvalidState(format!("read current directory: {error}"))
+            })?;
+            let backend = CopilotBackend::new(cwd).with_request_store(store.clone());
+            run_broker(Broker::new(store, backend, LocalHostConnector), once, stdio).await
+        }
+    }
+}
+
+async fn run_broker<B>(broker: Broker<B, LocalHostConnector>, once: bool, stdio: bool) -> Result<()>
+where
+    B: AgentBackend + 'static,
+{
     if stdio {
         let server = SingletonMcpServer::new(broker);
         let service = server

@@ -1,14 +1,15 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use singleton_core::{
-    AgentBackend, BackendMessage, BackendSession, BackendSessionConfig, Capabilities,
-    CapabilityLimits, CleanupSummary, CloseDisposition, DEFAULT_MCP_TOOLS, Event, Inbox, InboxItem,
-    PendingRequest, RequestDecision, RequestKind, ResourceKind, ResourceStatus, Result, Session,
-    SingletonError, TurnId, Workspace, WorkspaceSpec, backend_payload_summary, resource_uri,
+    AgentBackend, BackendEvent, BackendMessage, BackendSession, BackendSessionConfig, BackendTurn,
+    Capabilities, CapabilityLimits, CleanupSummary, CloseDisposition, DEFAULT_MCP_TOOLS, Event,
+    Inbox, InboxItem, PendingRequest, RequestDecision, RequestKind, ResourceKind, ResourceStatus,
+    Result, Session, SingletonError, TurnId, Workspace, WorkspaceSpec, backend_payload_summary,
+    resource_uri,
 };
 use singleton_core::{HostConnector, compact_json};
 use singleton_store::{Store, new_request, new_session, new_turn};
@@ -16,8 +17,8 @@ use singleton_store::{Store, new_request, new_session, new_turn};
 #[derive(Clone)]
 pub struct Broker<B, H>
 where
-    B: AgentBackend,
-    H: HostConnector,
+    B: AgentBackend + 'static,
+    H: HostConnector + 'static,
 {
     store: Store,
     backend: Arc<B>,
@@ -30,11 +31,13 @@ where
     H: HostConnector,
 {
     pub fn new(store: Store, backend: B, host: H) -> Self {
-        Self {
+        let broker = Self {
             store,
             backend: Arc::new(backend),
             host: Arc::new(host),
-        }
+        };
+        broker.reconcile_interrupted_turns();
+        broker
     }
 
     pub fn store(&self) -> &Store {
@@ -168,8 +171,8 @@ where
             &turn.resource_uri,
             Some(&session.resource_uri),
             "turn.started",
-            "backend",
-            &session.backend,
+            "singleton",
+            "broker",
             json!({ "turn_id": turn.turn_id }),
         )?;
         self.store.update_session_status(
@@ -177,46 +180,19 @@ where
             ResourceStatus::Running,
             Some(started.server_seq),
         )?;
-
-        let backend_turn = self
-            .backend
-            .send_message(
-                &backend_session,
-                BackendMessage {
-                    turn_id: turn.turn_id.clone(),
-                    content: request.message,
-                    mode: request.mode,
-                },
-            )
-            .await?;
-
-        let mut latest = started.server_seq.max(queued.server_seq);
-        for event in &backend_turn.events {
-            latest = self.ingest_backend_event(&session, &turn, event.clone())?;
-        }
-        let unread = matches!(
-            backend_turn.status,
-            ResourceStatus::Completed | ResourceStatus::Failed | ResourceStatus::NeedsInput
+        self.spawn_backend_turn(
+            &session,
+            &turn,
+            backend_session,
+            request.message,
+            request.mode,
+            started.server_seq.max(queued.server_seq),
         );
-        self.store.update_turn_status(
-            &turn.turn_id,
-            Some(&backend_turn.backend_turn_id),
-            backend_turn.status.clone(),
-            unread,
-        )?;
-        let session_status = if backend_turn.status == ResourceStatus::Completed {
-            ResourceStatus::Idle
-        } else {
-            backend_turn.status.clone()
-        };
-        self.store
-            .update_session_status(&session.session_id, session_status, Some(latest))?;
-
         Ok(SendMessageReply {
             turn_id: turn.turn_id,
             resource_uri: turn.resource_uri,
-            status: backend_turn.status,
-            event_cursor: latest,
+            status: ResourceStatus::Running,
+            event_cursor: started.server_seq.max(queued.server_seq),
         })
     }
 
@@ -467,53 +443,207 @@ where
         })
     }
 
-    fn ingest_backend_event(
+    fn reconcile_interrupted_turns(&self) {
+        let Ok(turns) = self.store.mark_interrupted_turns() else {
+            return;
+        };
+        for turn in turns {
+            let session_uri = resource_uri(ResourceKind::Session, &turn.session_id);
+            let Ok(event) = self.store.append_event(
+                &turn.resource_uri,
+                Some(&session_uri),
+                "turn.failed",
+                "singleton",
+                "broker",
+                json!({
+                    "summary": "turn interrupted by broker shutdown or restart",
+                    "retryable": true
+                }),
+            ) else {
+                continue;
+            };
+            let _ = self.store.update_session_status(
+                &turn.session_id,
+                ResourceStatus::Idle,
+                Some(event.server_seq),
+            );
+        }
+    }
+
+    fn spawn_backend_turn(
         &self,
         session: &Session,
         turn: &singleton_core::Turn,
-        event: singleton_core::BackendEvent,
-    ) -> Result<i64> {
-        if event.event_type == "request.created" {
-            let request_kind = match event
-                .payload
-                .get("request_kind")
-                .and_then(Value::as_str)
-                .unwrap_or("permission")
-            {
-                "input" => RequestKind::Input,
-                "elicitation" => RequestKind::Elicitation,
-                _ => RequestKind::Permission,
-            };
-            let summary = backend_payload_summary(&event.payload);
-            let request = new_request(
-                session.session_id.clone(),
-                Some(turn.turn_id.clone()),
-                request_kind,
-                summary,
-                event.payload.clone(),
-            );
-            self.store.insert_request(&request)?;
-            let stored = self.store.append_event(
-                &request.resource_uri,
-                Some(&turn.resource_uri),
-                &event.event_type,
-                "backend",
-                &session.backend,
-                event.payload,
-            )?;
-            return Ok(stored.server_seq);
-        }
+        backend_session: BackendSession,
+        message: String,
+        mode: Option<String>,
+        latest_cursor: i64,
+    ) {
+        let backend = self.backend.clone();
+        let store = self.store.clone();
+        let session = session.clone();
+        let turn = turn.clone();
+        let latest = Arc::new(Mutex::new(latest_cursor));
+        let sink_latest = latest.clone();
+        let sink_store = store.clone();
+        let sink_session = session.clone();
+        let sink_turn = turn.clone();
+        let event_sink = Arc::new(move |event: BackendEvent| {
+            let seq = ingest_backend_event(&sink_store, &sink_session, &sink_turn, event)?;
+            if let Ok(mut latest) = sink_latest.lock() {
+                *latest = seq;
+            }
+            Ok(())
+        });
+        tokio::spawn(async move {
+            let result = backend
+                .send_message(
+                    &backend_session,
+                    BackendMessage {
+                        turn_id: turn.turn_id.clone(),
+                        content: message,
+                        mode,
+                    },
+                    event_sink,
+                )
+                .await;
+            let latest_seq = latest.lock().map(|latest| *latest).unwrap_or(latest_cursor);
+            match result {
+                Ok(backend_turn) => {
+                    let _ =
+                        finalize_backend_turn(&store, &session, &turn, backend_turn, latest_seq);
+                }
+                Err(error) => {
+                    let _ = fail_backend_turn(&store, &session, &turn, error.to_string());
+                }
+            }
+        });
+    }
+}
 
-        let stored = self.store.append_event(
-            &turn.resource_uri,
-            Some(&session.resource_uri),
+fn ingest_backend_event(
+    store: &Store,
+    session: &Session,
+    turn: &singleton_core::Turn,
+    event: BackendEvent,
+) -> Result<i64> {
+    if event.event_type == "request.created" {
+        let request_kind = match event
+            .payload
+            .get("request_kind")
+            .and_then(Value::as_str)
+            .unwrap_or("permission")
+        {
+            "input" => RequestKind::Input,
+            "elicitation" => RequestKind::Elicitation,
+            _ => RequestKind::Permission,
+        };
+        let summary = backend_payload_summary(&event.payload);
+        let request = new_request(
+            session.session_id.clone(),
+            Some(turn.turn_id.clone()),
+            request_kind,
+            summary,
+            event.payload.clone(),
+        );
+        store.insert_request(&request)?;
+        let stored = store.append_event(
+            &request.resource_uri,
+            Some(&turn.resource_uri),
             &event.event_type,
             "backend",
             &session.backend,
             event.payload,
         )?;
-        Ok(stored.server_seq)
+        return Ok(stored.server_seq);
     }
+
+    let stored = store.append_event(
+        &turn.resource_uri,
+        Some(&session.resource_uri),
+        &event.event_type,
+        "backend",
+        &session.backend,
+        event.payload,
+    )?;
+    Ok(stored.server_seq)
+}
+
+fn finalize_backend_turn(
+    store: &Store,
+    session: &Session,
+    turn: &singleton_core::Turn,
+    backend_turn: BackendTurn,
+    latest_seq: i64,
+) -> Result<()> {
+    let mut latest = latest_seq;
+    let terminal_event_type = match backend_turn.status {
+        ResourceStatus::Completed => Some("turn.completed"),
+        ResourceStatus::Failed => Some("turn.failed"),
+        ResourceStatus::Cancelled => Some("turn.cancelled"),
+        ResourceStatus::NeedsInput => Some("turn.needs_input"),
+        _ => None,
+    };
+    let mut saw_terminal_event = false;
+    for event in backend_turn.events {
+        saw_terminal_event |= Some(event.event_type.as_str()) == terminal_event_type;
+        latest = ingest_backend_event(store, session, turn, event)?;
+    }
+    if let Some(event_type) = terminal_event_type
+        && !saw_terminal_event
+    {
+        let event = store.append_event(
+            &turn.resource_uri,
+            Some(&session.resource_uri),
+            event_type,
+            "backend",
+            &session.backend,
+            json!({ "backend_turn_id": backend_turn.backend_turn_id }),
+        )?;
+        latest = event.server_seq;
+    }
+    let unread = matches!(
+        backend_turn.status,
+        ResourceStatus::Completed
+            | ResourceStatus::Failed
+            | ResourceStatus::NeedsInput
+            | ResourceStatus::Cancelled
+    );
+    store.update_turn_status(
+        &turn.turn_id,
+        Some(&backend_turn.backend_turn_id),
+        backend_turn.status.clone(),
+        unread,
+    )?;
+    let session_status = match backend_turn.status {
+        ResourceStatus::Completed | ResourceStatus::Cancelled => ResourceStatus::Idle,
+        other => other,
+    };
+    store.update_session_status(&session.session_id, session_status, Some(latest))?;
+    Ok(())
+}
+
+fn fail_backend_turn(
+    store: &Store,
+    session: &Session,
+    turn: &singleton_core::Turn,
+    summary: String,
+) -> Result<()> {
+    let event = store.append_event(
+        &turn.resource_uri,
+        Some(&session.resource_uri),
+        "turn.failed",
+        "backend",
+        &session.backend,
+        json!({ "summary": summary, "retryable": true }),
+    )?;
+    store.update_turn_status(&turn.turn_id, None, ResourceStatus::Failed, true)?;
+    store.update_session_status(
+        &session.session_id,
+        ResourceStatus::Idle,
+        Some(event.server_seq),
+    )?;
+    Ok(())
 }
 
 fn backend_session_from(session: &Session) -> Result<BackendSession> {
@@ -691,14 +821,14 @@ mod tests {
             })
             .await?;
 
-        assert_eq!(sent.status, ResourceStatus::Completed);
+        assert_eq!(sent.status, ResourceStatus::Running);
         let events = broker
             .read_events(ReadEventsRequest {
                 session_id: Some(created.session_id),
-                cursor: Some(0),
+                cursor: Some(sent.event_cursor),
                 limit: Some(100),
-                event_types: Vec::new(),
-                wait_ms: None,
+                event_types: vec!["turn.completed".to_string()],
+                wait_ms: Some(1_000),
                 resource_uri: None,
             })
             .await?;
@@ -708,6 +838,7 @@ mod tests {
                 .iter()
                 .any(|event| event.event_type == "turn.completed")
         );
+        assert_eq!(events.events.len(), 1);
         assert_eq!(broker.get_inbox()?.counts.completed_turn, 1);
         Ok(())
     }
@@ -737,6 +868,16 @@ mod tests {
                 session_id: created.session_id,
                 message: "run command".to_string(),
                 mode: None,
+            })
+            .await?;
+        broker
+            .read_events(ReadEventsRequest {
+                session_id: None,
+                cursor: Some(0),
+                limit: Some(100),
+                event_types: vec!["request.created".to_string()],
+                wait_ms: Some(1_000),
+                resource_uri: None,
             })
             .await?;
         let inbox = broker.get_inbox()?;
@@ -821,6 +962,34 @@ mod tests {
         let snapshot = ahp_like_session_snapshot(&detail);
         assert_eq!(snapshot["kind"], "session");
         assert_eq!(snapshot["resource"], created.resource_uri);
+        Ok(())
+    }
+
+    #[test]
+    fn broker_startup_marks_stale_active_turns_interrupted() -> Result<()> {
+        let store = Store::open_memory()?;
+        let mut session = new_session("interrupted".to_string(), "fake".to_string(), None);
+        session.status = ResourceStatus::Running;
+        session.backend_session_id = Some("fake_sess_existing".to_string());
+        store.insert_session(&session)?;
+        let mut turn = new_turn(session.session_id.clone(), "still running".to_string());
+        turn.status = ResourceStatus::Running;
+        store.insert_turn(&turn)?;
+
+        let broker = Broker::new(store.clone(), FakeBackend::new(), LocalHostConnector);
+
+        let recovered_turn = store.get_turn(&turn.turn_id)?;
+        assert_eq!(recovered_turn.status, ResourceStatus::Failed);
+        assert!(recovered_turn.unread);
+        let recovered_session = broker.get_session(&session.session_id)?;
+        assert_eq!(recovered_session.session.status, ResourceStatus::Idle);
+        let events = broker.store().read_events(
+            Some(&turn.resource_uri),
+            0,
+            100,
+            &["turn.failed".to_string()],
+        )?;
+        assert_eq!(events.len(), 1);
         Ok(())
     }
 }

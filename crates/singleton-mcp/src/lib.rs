@@ -26,8 +26,8 @@ where
 #[derive(Clone)]
 pub struct SingletonMcpServer<B, H>
 where
-    B: AgentBackend,
-    H: HostConnector,
+    B: AgentBackend + 'static,
+    H: HostConnector + 'static,
 {
     broker: Broker<B, H>,
     tool_router: ToolRouter<Self>,
@@ -228,14 +228,31 @@ mod tests {
             .map_err(SingletonError::InvalidInput)?;
         let Json(sent) = server
             .send_message(Parameters(SendMessageRequest {
-                session_id: created.session_id,
+                session_id: created.session_id.clone(),
                 message: "hello".to_string(),
                 mode: None,
             }))
             .await
             .map_err(SingletonError::InvalidInput)?;
 
-        assert_eq!(sent.status, ResourceStatus::Completed);
+        assert_eq!(sent.status, ResourceStatus::Running);
+        let Json(events) = server
+            .read_events(Parameters(ReadEventsRequest {
+                session_id: Some(created.session_id),
+                resource_uri: None,
+                cursor: Some(0),
+                limit: Some(100),
+                event_types: vec!["turn.completed".to_string()],
+                wait_ms: Some(1_000),
+            }))
+            .await
+            .map_err(SingletonError::InvalidInput)?;
+        assert!(
+            events
+                .events
+                .iter()
+                .any(|event| event.event_type == "turn.completed")
+        );
         Ok(())
     }
 }
