@@ -31,6 +31,10 @@ The `singletond` daemon is the local control plane. It:
 - manages local workspace lifecycle, including git worktrees
 
 The daemon does not own a user-facing hub session or terminal UI.
+Foreground MCP clients should connect through `singleton serve --stdio`, which
+acts as a stdio proxy to the daemon's local Unix socket. The proxy may exit when
+the foreground agent disconnects; the daemon and its background turn tasks keep
+running until `singleton stop` or process termination.
 
 ### 2.2 Foreground agent
 
@@ -165,6 +169,7 @@ Default tools:
 |---|---|
 | `get_capabilities` | Return available hosts, backends, workspace strategies, limits, and protocol versions. |
 | `get_inbox` | Return a compact fan-in view of pending permissions, input requests, failed turns, unread completions, and stale sessions. |
+| `ack_inbox` | Mark unread completed or failed turn inbox items as read after the foreground agent has handled them. |
 | `ensure_workspace` | Create or resolve a workspace, including local paths and git worktrees. |
 | `create_session` | Create a background session, optionally with an inline workspace spec. |
 | `send_message` | Start an asynchronous turn and return a `turn_id`. |
@@ -181,6 +186,7 @@ Tools intentionally collapsed out of the default surface:
 - `read_output` is deferred until event payloads become too large.
 - `list_pending_approvals` is covered by `get_inbox`.
 - separate approve/deny tools are `resolve_request(decision=...)`.
+- completion/read-state mutations are `ack_inbox`.
 - separate archive/delete tools are `close_resource(disposition=...)`.
 - separate host/backend list tools are `get_capabilities`.
 
@@ -234,6 +240,14 @@ The current `AgentBackend` contract accepts a fallible event sink during
 `send_message`. Backends emit normalized `BackendEvent` values into that sink
 while the broker-owned background task remains responsible for terminal turn
 status reconciliation.
+
+Backends also advertise whether they can resume sessions and whether they can
+reattach already-running turns after broker restart. On startup, the broker
+resumes persisted backend sessions when supported. Active turns are reattached
+only when the backend explicitly supports turn reattach; otherwise they are
+marked failed/unread with a retryable interruption event and pending requests
+for that turn are cancelled. The Copilot MVP resumes sessions for future turns,
+but does not claim active-turn reattach.
 
 ### 6.2 Host connector
 
@@ -289,6 +303,11 @@ Current tables:
 - `resource_states`
 - `changesets`
 - `artifacts`
+
+Daemon lifecycle state is intentionally filesystem-backed: the default SQLite
+database is `~/.singleton/singleton.db`, with sibling pid/socket files. An
+explicit `--database` path derives sibling pid/socket paths, with long socket
+paths hashed into the system temp directory to satisfy Unix socket limits.
 
 `events` must include:
 

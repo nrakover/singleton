@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use github_copilot_sdk::handler::{
@@ -105,11 +105,20 @@ impl CopilotBackend {
 #[derive(Clone)]
 pub struct StoreRequestBroker {
     store: Store,
+    request_timeout: Duration,
 }
 
 impl StoreRequestBroker {
     pub fn new(store: Store) -> Self {
-        Self { store }
+        Self {
+            store,
+            request_timeout: Duration::from_secs(60 * 60 * 24),
+        }
+    }
+
+    pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
+        self
     }
 
     fn create_request(
@@ -156,9 +165,19 @@ impl StoreRequestBroker {
     }
 
     async fn wait_for_resolution(&self, request_id: &str) -> Option<PendingRequest> {
+        let deadline = Instant::now() + self.request_timeout;
         loop {
             match self.store.get_request(request_id) {
                 Ok(request) if request.status != RequestStatus::Pending => return Some(request),
+                Ok(_) if Instant::now() >= deadline => {
+                    let _ = self.store.resolve_request(
+                        request_id,
+                        RequestDecision::Cancel,
+                        None,
+                        Some("request timed out waiting for foreground resolution".to_string()),
+                    );
+                    return self.store.get_request(request_id).ok();
+                }
                 Ok(_) => sleep(Duration::from_millis(250)).await,
                 Err(_) => return None,
             }
@@ -308,6 +327,7 @@ impl AgentBackend for CopilotBackend {
             backend_id: COPILOT_BACKEND_ID.to_string(),
             display_name: "GitHub Copilot".to_string(),
             supports_resume: true,
+            supports_turn_reattach: false,
             supports_cancel: true,
             supports_permissions: true,
         }
@@ -497,8 +517,35 @@ mod tests {
         let caps = backend.capabilities();
         assert_eq!(caps.backend_id, COPILOT_BACKEND_ID);
         assert!(caps.supports_resume);
+        assert!(!caps.supports_turn_reattach);
         assert!(caps.supports_cancel);
         assert!(caps.supports_permissions);
+    }
+
+    #[tokio::test]
+    async fn request_wait_timeout_cancels_pending_request() -> Result<()> {
+        let store = Store::open_memory()?;
+        let request = new_request(
+            "sess_test".to_string(),
+            None,
+            RequestKind::Input,
+            "Need input".to_string(),
+            json!({ "summary": "Need input" }),
+        );
+        store.insert_request(&request)?;
+        let broker = StoreRequestBroker::new(store.clone()).with_request_timeout(Duration::ZERO);
+
+        let resolved = broker.wait_for_resolution(&request.request_id).await;
+
+        assert_eq!(
+            resolved.as_ref().map(|request| &request.status),
+            Some(&RequestStatus::Cancelled)
+        );
+        assert_eq!(
+            store.get_request(&request.request_id)?.status,
+            RequestStatus::Cancelled
+        );
+        Ok(())
     }
 
     #[cfg(feature = "live-copilot")]

@@ -322,6 +322,28 @@ impl Store {
         Ok(sessions)
     }
 
+    pub fn sessions_with_backend_session_ids(&self) -> Result<Vec<Session>> {
+        let conn = self.conn.lock().map_err(|_| lock_err())?;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT session_id, resource_uri, title, description, backend, backend_session_id,
+                       workspace_id, status, latest_event_cursor, labels_json, created_at, updated_at
+                FROM sessions
+                WHERE backend_session_id IS NOT NULL
+                  AND status NOT IN ('archived', 'disposed', 'deleted')
+                ORDER BY updated_at ASC
+                "#,
+            )
+            .map_err(store_err)?;
+        let mut rows = stmt.query([]).map_err(store_err)?;
+        let mut sessions = Vec::new();
+        while let Some(row) = rows.next().map_err(store_err)? {
+            sessions.push(session_row(row).map_err(store_err)?.try_into_session()?);
+        }
+        Ok(sessions)
+    }
+
     pub fn update_session_backend(
         &self,
         session_id: &str,
@@ -492,6 +514,59 @@ impl Store {
         Ok(turns)
     }
 
+    pub fn acknowledge_inbox_turns(
+        &self,
+        session_id: Option<&str>,
+        turn_id: Option<&str>,
+        all: bool,
+    ) -> Result<usize> {
+        let now = now_rfc3339();
+        let conn = self.conn.lock().map_err(|_| lock_err())?;
+        match (turn_id, session_id, all) {
+            (Some(turn_id), _, _) => {
+                conn.execute(
+                    r#"
+                    UPDATE turns
+                    SET unread = 0, updated_at = ?2
+                    WHERE turn_id = ?1 AND unread = 1
+                    "#,
+                    params![turn_id, now],
+                )
+                .map_err(store_err)?;
+            }
+            (None, Some(session_id), _) => {
+                conn.execute(
+                    r#"
+                    UPDATE turns
+                    SET unread = 0, updated_at = ?2
+                    WHERE session_id = ?1 AND unread = 1
+                    "#,
+                    params![session_id, now],
+                )
+                .map_err(store_err)?;
+            }
+            (None, None, true) => {
+                conn.execute(
+                    r#"
+                    UPDATE turns
+                    SET unread = 0, updated_at = ?1
+                    WHERE unread = 1
+                    "#,
+                    params![now],
+                )
+                .map_err(store_err)?;
+            }
+            (None, None, false) => {
+                return Err(SingletonError::InvalidInput(
+                    "acknowledge requires turn_id, session_id, or all=true".to_string(),
+                ));
+            }
+        }
+        usize::try_from(conn.changes()).map_err(|error| {
+            SingletonError::Store(format!("invalid acknowledged count conversion: {error}"))
+        })
+    }
+
     pub fn insert_request(&self, request: &PendingRequest) -> Result<()> {
         let conn = self.conn.lock().map_err(|_| lock_err())?;
         conn.execute(
@@ -581,6 +656,54 @@ impl Store {
         self.get_request(request_id)
     }
 
+    pub fn cancel_pending_requests_for_turn(
+        &self,
+        turn_id: &str,
+        reason: String,
+    ) -> Result<Vec<PendingRequest>> {
+        let resolved_at = now_rfc3339();
+        let resolution = json!({
+            "decision": RequestDecision::Cancel,
+            "response": Value::Null,
+        });
+        let resolution_json = json_string(&resolution)?;
+        let conn = self.conn.lock().map_err(|_| lock_err())?;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT request_id, resource_uri, session_id, turn_id, kind, status, summary,
+                       payload_json, resolution_json, reason, created_at, resolved_at
+                FROM requests
+                WHERE turn_id = ?1 AND status = 'pending'
+                ORDER BY created_at ASC
+                "#,
+            )
+            .map_err(store_err)?;
+        let mut rows = stmt.query(params![turn_id]).map_err(store_err)?;
+        let mut requests = Vec::new();
+        while let Some(row) = rows.next().map_err(store_err)? {
+            requests.push(request_row(row).map_err(store_err)?.try_into_request()?);
+        }
+        drop(rows);
+        drop(stmt);
+        for request in &mut requests {
+            conn.execute(
+                r#"
+                UPDATE requests
+                SET status = 'cancelled', resolution_json = ?2, reason = ?3, resolved_at = ?4
+                WHERE request_id = ?1 AND status = 'pending'
+                "#,
+                params![request.request_id, resolution_json, reason, resolved_at],
+            )
+            .map_err(store_err)?;
+            request.status = RequestStatus::Cancelled;
+            request.resolution = Some(resolution.clone());
+            request.reason = Some(reason.clone());
+            request.resolved_at = Some(resolved_at.clone());
+        }
+        Ok(requests)
+    }
+
     pub fn get_request(&self, request_id: &str) -> Result<PendingRequest> {
         let conn = self.conn.lock().map_err(|_| lock_err())?;
         let row = conn
@@ -616,37 +739,50 @@ impl Store {
     }
 
     pub fn mark_interrupted_turns(&self) -> Result<Vec<Turn>> {
-        let now = now_rfc3339();
+        let interrupted = self.active_turns_for_recovery()?;
+        for turn in &interrupted {
+            self.mark_turn_interrupted(
+                &turn.turn_id,
+                "turn interrupted by broker shutdown or restart",
+            )?;
+        }
+        Ok(interrupted)
+    }
+
+    pub fn active_turns_for_recovery(&self) -> Result<Vec<Turn>> {
         let conn = self.conn.lock().map_err(|_| lock_err())?;
         let mut stmt = conn
             .prepare(
                 r#"
                 SELECT turn_id, resource_uri, session_id, backend_turn_id, message, status, unread, created_at, updated_at
                 FROM turns
-                WHERE status IN ('queued', 'running')
+                WHERE status IN ('queued', 'running', 'needs_input')
                 ORDER BY created_at ASC
                 "#,
             )
             .map_err(store_err)?;
         let mut rows = stmt.query([]).map_err(store_err)?;
-        let mut interrupted = Vec::new();
+        let mut turns = Vec::new();
         while let Some(row) = rows.next().map_err(store_err)? {
-            interrupted.push(turn_row(row).map_err(store_err)?.try_into_turn()?);
+            turns.push(turn_row(row).map_err(store_err)?.try_into_turn()?);
         }
-        drop(rows);
-        drop(stmt);
-        for turn in &interrupted {
-            conn.execute(
-                r#"
-                UPDATE turns
-                SET status = 'failed', unread = 1, updated_at = ?2
-                WHERE turn_id = ?1 AND status IN ('queued', 'running')
-                "#,
-                params![turn.turn_id, now],
-            )
-            .map_err(store_err)?;
-        }
-        Ok(interrupted)
+        Ok(turns)
+    }
+
+    pub fn mark_turn_interrupted(&self, turn_id: &str, _summary: &str) -> Result<Turn> {
+        let now = now_rfc3339();
+        let conn = self.conn.lock().map_err(|_| lock_err())?;
+        conn.execute(
+            r#"
+            UPDATE turns
+            SET status = 'failed', unread = 1, updated_at = ?2
+            WHERE turn_id = ?1 AND status IN ('queued', 'running', 'needs_input')
+            "#,
+            params![turn_id, now],
+        )
+        .map_err(store_err)?;
+        drop(conn);
+        self.get_turn(turn_id)
     }
 
     pub fn append_event(

@@ -142,6 +142,7 @@ Output:
       "backend_id": "copilot",
       "display_name": "GitHub Copilot",
       "supports_resume": true,
+      "supports_turn_reattach": false,
       "supports_cancel": true,
       "supports_permissions": true
     }
@@ -196,7 +197,36 @@ Output:
 Inbox items must be concise. Detailed payloads should be read with
 `get_session` or `read_events`.
 
-### 4.3 `ensure_workspace`
+### 4.3 `ack_inbox`
+
+Purpose: mark unread completed or failed turn inbox items as handled.
+
+Input:
+
+```json
+{
+  "turn_id": "turn_..."
+}
+```
+
+Supported selectors:
+
+- `turn_id`
+- `session_id`
+- `all: true`
+
+Output:
+
+```json
+{
+  "acknowledged": 1
+}
+```
+
+The call is idempotent. It only mutates singleton unread state; it does not
+archive sessions, delete workspaces, or modify backend transcripts.
+
+### 4.4 `ensure_workspace`
 
 Purpose: create or resolve a workspace.
 
@@ -241,7 +271,7 @@ Output:
 }
 ```
 
-### 4.4 `create_session`
+### 4.5 `create_session`
 
 Purpose: create a durable background session.
 
@@ -281,7 +311,7 @@ Output:
 If `workspace` is inline, it must be resolved through the same path as
 `ensure_workspace`.
 
-### 4.5 `send_message`
+### 4.6 `send_message`
 
 Purpose: enqueue/start an asynchronous turn.
 
@@ -312,7 +342,7 @@ The primitive is asynchronous. Foreground agents should poll or long-poll with
 dispatch was started; completion/failure/needs-input is observed later via
 events, `get_session`, or `get_inbox`.
 
-### 4.6 `read_events`
+### 4.7 `read_events`
 
 Purpose: read sequence-numbered events for any resource.
 
@@ -360,7 +390,7 @@ Output:
 
 `wait_ms` replaces a separate wait tool.
 
-### 4.7 `list_sessions`
+### 4.8 `list_sessions`
 
 Purpose: recover coordination state after context loss.
 
@@ -395,7 +425,7 @@ Output:
 }
 ```
 
-### 4.8 `get_session`
+### 4.9 `get_session`
 
 Purpose: inspect one session.
 
@@ -429,7 +459,7 @@ Output:
 }
 ```
 
-### 4.9 `resolve_request`
+### 4.10 `resolve_request`
 
 Purpose: resolve permission, input, or elicitation requests.
 
@@ -467,7 +497,7 @@ Output:
 }
 ```
 
-### 4.10 `cancel_turn`
+### 4.11 `cancel_turn`
 
 Purpose: cancel a running turn.
 
@@ -481,6 +511,9 @@ Input:
 ```
 
 If `turn_id` is omitted, the active turn for the session is cancelled.
+Cancelling a turn must cancel any pending singleton requests for that turn so
+backend permission/input handlers unblock and return provider-specific cancel or
+reject responses.
 
 Output:
 
@@ -491,7 +524,7 @@ Output:
 }
 ```
 
-### 4.11 `close_resource`
+### 4.12 `close_resource`
 
 Purpose: archive, dispose, or delete sessions and workspaces.
 
@@ -548,6 +581,8 @@ Required repository capabilities:
 - create and update hosts/workspaces/sessions/chats/turns/requests
 - resolve requests atomically
 - mark sessions degraded when backend resume fails
+- acknowledge unread turn inbox items
+- cancel pending requests for cancelled or interrupted turns
 - archive/dispose/delete resources with idempotent semantics
 
 Large payloads may be stored in JSONL/blob files referenced from SQLite, but
@@ -569,10 +604,13 @@ Initial categories:
 - `workspace.changeset.created`
 - `session.created`
 - `session.resumed`
+- `session.reattached`
+- `session.degraded`
 - `session.status_changed`
 - `session.archived`
 - `turn.queued`
 - `turn.started`
+- `turn.reattached`
 - `turn.completed`
 - `turn.failed`
 - `turn.cancelled`
@@ -580,6 +618,8 @@ Initial categories:
 - `message.completed`
 - `request.created`
 - `request.resolved`
+- `request.cancelled`
+- `inbox.acknowledged`
 - `backend.event`
 - `backend.error`
 
@@ -597,9 +637,25 @@ Initial commands:
 ```bash
 singleton serve
 singleton serve --backend copilot --stdio
+singleton serve --backend copilot --stdio --direct
+singleton start --backend copilot
 singleton status
 singleton stop
+singleton mcp-config --backend copilot
 ```
+
+`serve --stdio` is the MCP entrypoint for foreground agents. By default it
+starts or reuses the daemon and proxies stdio to a local Unix socket so MCP
+client disconnects do not kill background turns. `serve --stdio --direct` runs
+the broker directly on stdio for debugging.
+
+State path rules:
+
+- default database: `~/.singleton/singleton.db`
+- default socket/pid: sibling `singleton.sock` and `singleton.pid`
+- explicit `--database /path/name.db`: sibling `name.sock` and `name.pid`
+- long socket paths are hashed into the system temp directory to satisfy Unix
+  socket path limits
 
 Optional later commands:
 

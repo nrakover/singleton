@@ -116,13 +116,16 @@ loop:
     if item.kind == "failed_turn":
       read_events({ session_id: item.session_id, cursor: last_cursor })
       decide whether to retry, cancel, or report failure
+      ack_inbox({ turn_id: item.turn_id })
 
     if item.kind == "completed_turn":
       read_events({ session_id: item.session_id, cursor: last_cursor })
       summarize the result
+      ack_inbox({ turn_id: item.turn_id })
 ```
 
-Keep inbox summaries short. Use `read_events` for detail.
+Keep inbox summaries short. Use `read_events` for detail, then acknowledge
+handled turn items so they do not stay in the unread inbox.
 
 ## Approval policy prompt
 

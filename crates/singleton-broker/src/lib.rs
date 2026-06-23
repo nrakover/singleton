@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -14,7 +15,6 @@ use singleton_core::{
 use singleton_core::{HostConnector, compact_json};
 use singleton_store::{Store, new_request, new_session, new_turn};
 
-#[derive(Clone)]
 pub struct Broker<B, H>
 where
     B: AgentBackend + 'static,
@@ -23,6 +23,20 @@ where
     store: Store,
     backend: Arc<B>,
     host: Arc<H>,
+}
+
+impl<B, H> Clone for Broker<B, H>
+where
+    B: AgentBackend + 'static,
+    H: HostConnector + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            backend: self.backend.clone(),
+            host: self.host.clone(),
+        }
+    }
 }
 
 impl<B, H> Broker<B, H>
@@ -38,6 +52,16 @@ where
         };
         broker.reconcile_interrupted_turns();
         broker
+    }
+
+    pub async fn new_with_reconnect(store: Store, backend: B, host: H) -> Result<Self> {
+        let broker = Self {
+            store,
+            backend: Arc::new(backend),
+            host: Arc::new(host),
+        };
+        broker.reconcile_backend_state().await?;
+        Ok(broker)
     }
 
     pub fn store(&self) -> &Store {
@@ -304,6 +328,28 @@ where
         Ok(inbox)
     }
 
+    pub fn ack_inbox(&self, request: AckInboxRequest) -> Result<AckInboxReply> {
+        let acknowledged = self.store.acknowledge_inbox_turns(
+            request.session_id.as_deref(),
+            request.turn_id.as_deref(),
+            request.all,
+        )?;
+        self.store.append_event(
+            "singleton-root://",
+            None,
+            "inbox.acknowledged",
+            "singleton",
+            "broker",
+            json!({
+                "session_id": request.session_id,
+                "turn_id": request.turn_id,
+                "all": request.all,
+                "acknowledged": acknowledged,
+            }),
+        )?;
+        Ok(AckInboxReply { acknowledged })
+    }
+
     pub fn resolve_request(&self, request: ResolveRequest) -> Result<PendingRequest> {
         let resolved = self.store.resolve_request(
             &request.request_id,
@@ -340,6 +386,10 @@ where
             .backend_turn_id
             .clone()
             .unwrap_or_else(|| turn.turn_id.clone());
+        self.cancel_pending_requests_for_turn(
+            &turn,
+            "turn cancelled by foreground request".to_string(),
+        )?;
         self.backend
             .cancel_turn(&backend_session, backend_turn_id.clone())
             .await?;
@@ -443,31 +493,209 @@ where
         })
     }
 
+    async fn reconcile_backend_state(&self) -> Result<()> {
+        let capabilities = self.backend.capabilities();
+        let sessions = self.store.sessions_with_backend_session_ids()?;
+        let active_turns = self.store.active_turns_for_recovery()?;
+        let mut processed_turn_ids = HashSet::new();
+
+        for session in sessions
+            .into_iter()
+            .filter(|session| session.backend == capabilities.backend_id)
+        {
+            let session_active_turns = active_turns
+                .iter()
+                .filter(|turn| turn.session_id == session.session_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            if let Some(backend_session_id) = session.backend_session_id.clone() {
+                if capabilities.supports_resume {
+                    match self
+                        .backend
+                        .resume_session(backend_session_id.clone())
+                        .await
+                    {
+                        Ok(backend_session) => {
+                            let reattached = self.store.append_event(
+                                &session.resource_uri,
+                                None,
+                                "session.reattached",
+                                "backend",
+                                &session.backend,
+                                json!({ "backend_session_id": backend_session_id }),
+                            )?;
+                            if session_active_turns.is_empty() {
+                                self.store.update_session_status(
+                                    &session.session_id,
+                                    ResourceStatus::Idle,
+                                    Some(reattached.server_seq),
+                                )?;
+                            }
+                            for turn in session_active_turns {
+                                processed_turn_ids.insert(turn.turn_id.clone());
+                                if capabilities.supports_turn_reattach {
+                                    self.reattach_active_turn(
+                                        &session,
+                                        &turn,
+                                        backend_session.clone(),
+                                    )
+                                    .await?;
+                                } else {
+                                    self.mark_turn_interrupted_with_events(
+                                        &turn,
+                                        "backend resumed the session but does not support active turn reattach",
+                                    )?;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            self.store.append_event(
+                                &session.resource_uri,
+                                None,
+                                "session.degraded",
+                                "singleton",
+                                "broker",
+                                json!({
+                                    "backend_session_id": backend_session_id,
+                                    "summary": error.to_string(),
+                                }),
+                            )?;
+                            self.store.update_session_status(
+                                &session.session_id,
+                                ResourceStatus::Degraded,
+                                None,
+                            )?;
+                            for turn in session_active_turns {
+                                processed_turn_ids.insert(turn.turn_id.clone());
+                                self.mark_turn_interrupted_with_events(
+                                    &turn,
+                                    &format!("backend resume failed: {error}"),
+                                )?;
+                            }
+                        }
+                    }
+                } else {
+                    for turn in session_active_turns {
+                        processed_turn_ids.insert(turn.turn_id.clone());
+                        self.mark_turn_interrupted_with_events(
+                            &turn,
+                            "backend does not support session resume",
+                        )?;
+                    }
+                }
+            }
+        }
+
+        for turn in active_turns {
+            if !processed_turn_ids.contains(&turn.turn_id) {
+                self.mark_turn_interrupted_with_events(
+                    &turn,
+                    "backend session was unavailable during broker startup",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn reconcile_interrupted_turns(&self) {
-        let Ok(turns) = self.store.mark_interrupted_turns() else {
+        let Ok(turns) = self.store.active_turns_for_recovery() else {
             return;
         };
         for turn in turns {
-            let session_uri = resource_uri(ResourceKind::Session, &turn.session_id);
-            let Ok(event) = self.store.append_event(
-                &turn.resource_uri,
-                Some(&session_uri),
-                "turn.failed",
+            let _ = self.mark_turn_interrupted_with_events(
+                &turn,
+                "turn interrupted by broker shutdown or restart",
+            );
+        }
+    }
+
+    async fn reattach_active_turn(
+        &self,
+        session: &Session,
+        turn: &singleton_core::Turn,
+        backend_session: BackendSession,
+    ) -> Result<()> {
+        let latest = Arc::new(Mutex::new(session.latest_event_cursor));
+        let sink_latest = latest.clone();
+        let sink_store = self.store.clone();
+        let sink_session = session.clone();
+        let sink_turn = turn.clone();
+        let event_sink = Arc::new(move |event: BackendEvent| {
+            let seq = ingest_backend_event(&sink_store, &sink_session, &sink_turn, event)?;
+            if let Ok(mut latest) = sink_latest.lock() {
+                *latest = seq;
+            }
+            Ok(())
+        });
+        let latest_seq = latest.lock().map(|latest| *latest).unwrap_or(0);
+        match self
+            .backend
+            .reattach_turn(&backend_session, turn, event_sink)
+            .await?
+        {
+            Some(backend_turn) => finalize_backend_turn(
+                &self.store,
+                session,
+                turn,
+                backend_turn,
+                latest.lock().map(|latest| *latest).unwrap_or(latest_seq),
+            ),
+            None => self.mark_turn_interrupted_with_events(
+                turn,
+                "backend did not reattach the active turn",
+            ),
+        }
+    }
+
+    fn mark_turn_interrupted_with_events(
+        &self,
+        turn: &singleton_core::Turn,
+        summary: &str,
+    ) -> Result<()> {
+        let interrupted = self.store.mark_turn_interrupted(&turn.turn_id, summary)?;
+        self.cancel_pending_requests_for_turn(&interrupted, summary.to_string())?;
+        let session_uri = resource_uri(ResourceKind::Session, &interrupted.session_id);
+        let event = self.store.append_event(
+            &interrupted.resource_uri,
+            Some(&session_uri),
+            "turn.failed",
+            "singleton",
+            "broker",
+            json!({
+                "summary": summary,
+                "retryable": true
+            }),
+        )?;
+        self.store.update_session_status(
+            &interrupted.session_id,
+            ResourceStatus::Idle,
+            Some(event.server_seq),
+        )?;
+        Ok(())
+    }
+
+    fn cancel_pending_requests_for_turn(
+        &self,
+        turn: &singleton_core::Turn,
+        reason: String,
+    ) -> Result<Vec<PendingRequest>> {
+        let requests = self
+            .store
+            .cancel_pending_requests_for_turn(&turn.turn_id, reason.clone())?;
+        for request in &requests {
+            self.store.append_event(
+                &request.resource_uri,
+                Some(&turn.resource_uri),
+                "request.cancelled",
                 "singleton",
                 "broker",
                 json!({
-                    "summary": "turn interrupted by broker shutdown or restart",
-                    "retryable": true
+                    "request_id": request.request_id,
+                    "reason": reason.clone(),
                 }),
-            ) else {
-                continue;
-            };
-            let _ = self.store.update_session_status(
-                &turn.session_id,
-                ResourceStatus::Idle,
-                Some(event.server_seq),
-            );
+            )?;
         }
+        Ok(requests)
     }
 
     fn spawn_backend_turn(
@@ -730,6 +958,19 @@ pub struct ResolveRequest {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct AckInboxRequest {
+    pub session_id: Option<String>,
+    pub turn_id: Option<TurnId>,
+    #[serde(default)]
+    pub all: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AckInboxReply {
+    pub acknowledged: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CancelTurnRequest {
     pub session_id: String,
@@ -990,6 +1231,141 @@ mod tests {
             &["turn.failed".to_string()],
         )?;
         assert_eq!(events.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ack_inbox_marks_completed_turns_read() -> Result<()> {
+        let broker = Broker::new(
+            Store::open_memory()?,
+            FakeBackend::new(),
+            LocalHostConnector,
+        );
+        let created = broker
+            .create_session(CreateSessionRequest {
+                description: "Ack inbox".to_string(),
+                title: None,
+                backend: None,
+                workspace: None,
+                model: None,
+                mode: None,
+                labels: Vec::new(),
+            })
+            .await?;
+        let sent = broker
+            .send_message(SendMessageRequest {
+                session_id: created.session_id,
+                message: "finish".to_string(),
+                mode: None,
+            })
+            .await?;
+        broker
+            .read_events(ReadEventsRequest {
+                session_id: None,
+                resource_uri: None,
+                cursor: Some(sent.event_cursor),
+                limit: Some(100),
+                event_types: vec!["turn.completed".to_string()],
+                wait_ms: Some(1_000),
+            })
+            .await?;
+        assert_eq!(broker.get_inbox()?.counts.completed_turn, 1);
+
+        let reply = broker.ack_inbox(AckInboxRequest {
+            turn_id: Some(sent.turn_id),
+            ..AckInboxRequest::default()
+        })?;
+
+        assert_eq!(reply.acknowledged, 1);
+        assert_eq!(broker.get_inbox()?.counts.completed_turn, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancel_turn_cancels_pending_requests() -> Result<()> {
+        let broker = Broker::new(
+            Store::open_memory()?,
+            FakeBackend::with_behaviors([FakeTurnBehavior::RequestPermission {
+                summary: "Allow command?".to_string(),
+            }]),
+            LocalHostConnector,
+        );
+        let created = broker
+            .create_session(CreateSessionRequest {
+                description: "Cancel request".to_string(),
+                title: None,
+                backend: None,
+                workspace: None,
+                model: None,
+                mode: None,
+                labels: Vec::new(),
+            })
+            .await?;
+        let sent = broker
+            .send_message(SendMessageRequest {
+                session_id: created.session_id.clone(),
+                message: "needs permission".to_string(),
+                mode: None,
+            })
+            .await?;
+        broker
+            .read_events(ReadEventsRequest {
+                session_id: Some(created.session_id.clone()),
+                cursor: Some(sent.event_cursor),
+                limit: Some(100),
+                event_types: vec!["request.created".to_string()],
+                wait_ms: Some(1_000),
+                resource_uri: None,
+            })
+            .await?;
+        assert_eq!(broker.get_inbox()?.counts.permission_request, 1);
+
+        broker
+            .cancel_turn(CancelTurnRequest {
+                session_id: created.session_id,
+                turn_id: Some(sent.turn_id),
+            })
+            .await?;
+
+        assert_eq!(broker.get_inbox()?.counts.permission_request, 0);
+        assert!(
+            broker
+                .store()
+                .read_events(None, 0, 100, &["request.cancelled".to_string()])?
+                .iter()
+                .any(|event| event.event_type == "request.cancelled")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn broker_startup_reattaches_active_turn_when_backend_supports_it() -> Result<()> {
+        let store = Store::open_memory()?;
+        let mut session = new_session("reattach".to_string(), "fake".to_string(), None);
+        session.status = ResourceStatus::Running;
+        session.backend_session_id = Some("fake_sess_existing".to_string());
+        store.insert_session(&session)?;
+        let mut turn = new_turn(session.session_id.clone(), "still running".to_string());
+        turn.status = ResourceStatus::Running;
+        turn.backend_turn_id = Some("fake_turn_existing".to_string());
+        store.insert_turn(&turn)?;
+
+        let broker =
+            Broker::new_with_reconnect(store.clone(), FakeBackend::new(), LocalHostConnector)
+                .await?;
+
+        let recovered_turn = store.get_turn(&turn.turn_id)?;
+        assert_eq!(recovered_turn.status, ResourceStatus::Completed);
+        assert!(recovered_turn.unread);
+        let recovered_session = broker.get_session(&session.session_id)?;
+        assert_eq!(recovered_session.session.status, ResourceStatus::Idle);
+        let events = broker.store().read_events(
+            Some(&turn.resource_uri),
+            0,
+            100,
+            &["turn.reattached".to_string(), "turn.completed".to_string()],
+        )?;
+        assert_eq!(events.len(), 2);
         Ok(())
     }
 }

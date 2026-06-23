@@ -68,6 +68,7 @@ impl AgentBackend for FakeBackend {
             backend_id: FAKE_BACKEND_ID.to_string(),
             display_name: "Fake backend".to_string(),
             supports_resume: true,
+            supports_turn_reattach: true,
             supports_cancel: true,
             supports_permissions: true,
         }
@@ -172,6 +173,33 @@ impl AgentBackend for FakeBackend {
             .cancelled_turns
             .push(turn_id);
         Ok(())
+    }
+
+    async fn reattach_turn(
+        &self,
+        _session: &BackendSession,
+        turn: &singleton_core::Turn,
+        event_sink: BackendEventSink,
+    ) -> Result<Option<BackendTurn>> {
+        let backend_turn_id = turn
+            .backend_turn_id
+            .clone()
+            .unwrap_or_else(|| new_id("fake_turn"));
+        event_sink(BackendEvent {
+            event_type: "turn.reattached".to_string(),
+            payload: json!({
+                "backend_turn_id": backend_turn_id.clone(),
+                "summary": "fake active turn reattached"
+            }),
+        })?;
+        Ok(Some(BackendTurn {
+            backend_turn_id,
+            status: ResourceStatus::Completed,
+            events: vec![BackendEvent {
+                event_type: "turn.completed".to_string(),
+                payload: json!({ "summary": "fake reattached turn completed" }),
+            }],
+        }))
     }
 }
 

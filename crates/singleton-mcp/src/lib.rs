@@ -6,9 +6,9 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use singleton_broker::{
-    Broker, CancelTurnReply, CancelTurnRequest, CloseResourceReply, CloseResourceRequest,
-    CreateSessionReply, CreateSessionRequest, ReadEventsReply, ReadEventsRequest, ResolveRequest,
-    SendMessageReply, SendMessageRequest, SessionDetail,
+    AckInboxReply, AckInboxRequest, Broker, CancelTurnReply, CancelTurnRequest, CloseResourceReply,
+    CloseResourceRequest, CreateSessionReply, CreateSessionRequest, ReadEventsReply,
+    ReadEventsRequest, ResolveRequest, SendMessageReply, SendMessageRequest, SessionDetail,
 };
 use singleton_core::{
     AgentBackend, Capabilities, HostConnector, Inbox, PendingRequest, Result as SingletonResult,
@@ -72,6 +72,14 @@ where
     )]
     pub async fn get_inbox(&self) -> std::result::Result<Json<Inbox>, String> {
         mcp_json(self.broker.get_inbox())
+    }
+
+    #[tool(description = "Acknowledge unread completed or failed turn inbox items.")]
+    pub async fn ack_inbox(
+        &self,
+        Parameters(request): Parameters<AckInboxRequest>,
+    ) -> std::result::Result<Json<AckInboxReply>, String> {
+        mcp_json(self.broker.ack_inbox(request))
     }
 
     #[tool(description = "Create or resolve a workspace, including local paths and git worktrees.")]

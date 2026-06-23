@@ -36,12 +36,13 @@ Core concepts:
 - local git worktree workspace provider
 - GitHub Copilot SDK backend
 - deterministic fake backend for tests
-- CLI admin commands: `serve`, `status`, `stop`
+- CLI admin commands: `serve`, `start`, `status`, `stop`, `mcp-config`
 
 Default MCP tools:
 
 - `get_capabilities`
 - `get_inbox`
+- `ack_inbox`
 - `ensure_workspace`
 - `create_session`
 - `send_message`
@@ -86,11 +87,16 @@ reference until the Rust replacement is implemented.
 ```bash
 cargo +1.94.0 run -p singleton-cli --bin singleton -- serve --once
 cargo +1.94.0 run -p singleton-cli --bin singleton -- serve --stdio
+cargo +1.94.0 run -p singleton-cli --bin singleton -- start --backend copilot
 cargo +1.94.0 run -p singleton-cli --bin singleton -- status
+cargo +1.94.0 run -p singleton-cli --bin singleton -- stop
+cargo +1.94.0 run -p singleton-cli --bin singleton -- mcp-config --backend copilot
 ```
 
-`serve --stdio` exposes the default singleton MCP tools over stdio using
-`rmcp`.
+`serve --stdio` is the foreground-agent entrypoint. It starts or reuses the
+local daemon, then proxies MCP newline JSON between stdio and the daemon's Unix
+socket so disconnecting the MCP client does not kill broker-owned background
+turns. `serve --stdio --direct` keeps the broker in the foreground for debugging.
 
 ## Planned verification
 

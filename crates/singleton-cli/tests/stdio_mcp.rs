@@ -8,6 +8,20 @@ use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 
 #[test]
+fn cli_start_status_stop_fake_daemon() -> TestResult<()> {
+    let db = NamedTempFile::new()?;
+    let database = db.path().to_string_lossy().to_string();
+
+    run_singleton(["start", "--backend", "fake", "--database", &database])?;
+    let status = run_singleton(["status", "--database", &database])?;
+    assert!(status.contains("daemon: running"), "{status}");
+    run_singleton(["stop", "--database", &database])?;
+    let status = run_singleton(["status", "--database", &database])?;
+    assert!(status.contains("daemon: stopped"), "{status}");
+    Ok(())
+}
+
+#[test]
 fn stdio_mcp_serves_fake_backend_vertical_slice() -> TestResult<()> {
     let db = NamedTempFile::new()?;
     let mut client = StdioMcpClient::spawn("fake", db.path().to_string_lossy().as_ref())?;
@@ -122,6 +136,7 @@ struct StdioMcpClient {
     child: Child,
     stdin: ChildStdin,
     rx: Receiver<Value>,
+    database: String,
 }
 
 impl StdioMcpClient {
@@ -161,7 +176,12 @@ impl StdioMcpClient {
                 line.clear();
             }
         });
-        Ok(Self { child, stdin, rx })
+        Ok(Self {
+            child,
+            stdin,
+            rx,
+            database: database.to_string(),
+        })
     }
 
     fn initialize(&mut self) -> TestResult<()> {
@@ -260,6 +280,12 @@ impl Drop for StdioMcpClient {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = Command::new(env!("CARGO_BIN_EXE_singleton"))
+            .args(["stop", "--database", &self.database])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 
@@ -279,4 +305,20 @@ fn tool_payload(result: &Value) -> TestResult<Value> {
 
 fn err(message: impl Into<String>) -> Box<dyn std::error::Error> {
     std::io::Error::other(message.into()).into()
+}
+
+fn run_singleton<const N: usize>(args: [&str; N]) -> TestResult<String> {
+    let output = Command::new(env!("CARGO_BIN_EXE_singleton"))
+        .args(args)
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(err(format!(
+            "singleton command failed with {}: stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(String::from_utf8(output.stdout)?)
 }

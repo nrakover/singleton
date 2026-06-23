@@ -48,7 +48,7 @@ tools.
 - local git worktree workspace provider
 - GitHub Copilot SDK backend
 - deterministic fake backend for tests
-- CLI admin commands: `serve`, `status`, `stop`
+- CLI admin commands: `serve`, `start`, `status`, `stop`, `mcp-config`
 - sequence-numbered event stream
 - fan-in inbox
 - safe/idempotent cleanup
@@ -73,6 +73,7 @@ The default MCP profile exposes only:
 
 - `get_capabilities`
 - `get_inbox`
+- `ack_inbox`
 - `ensure_workspace`
 - `create_session`
 - `send_message`
@@ -198,6 +199,19 @@ Current Phase 2 status:
   restarted local broker does not leave stale active turns.
 - CLI stdio integration test covers MCP initialize, tool discovery, create
   session, async send, and event polling through the fake backend.
+- `singleton serve --stdio` now starts/reuses a daemon and proxies stdio to a
+  Unix socket, so foreground MCP client disconnects do not kill broker-owned
+  turns. `serve --stdio --direct` remains available for foreground debugging.
+- `singleton start`, `singleton status`, and `singleton stop` manage daemon
+  pid/socket lifecycle for a selected state database.
+- `singleton mcp-config --backend copilot` prints an MCP server config snippet
+  using the daemon-backed stdio entrypoint.
+- Broker startup now resumes persisted backend sessions when supported and only
+  preserves active turns when the backend also supports active-turn reattach.
+  Otherwise active turns are failed/unread with retryable interruption events.
+- Cancelling or interrupting a turn now cancels pending requests for that turn so
+  backend permission/input/elicitation handlers can unblock.
+- `ack_inbox` marks unread completed/failed turn inbox items as read.
 - Ignored live Copilot smoke covers real SDK session creation plus send/event
   completion when run with `--features live-copilot -- --ignored`.
 - Ignored live CLI smoke covers `singleton serve --backend copilot --stdio`
@@ -237,5 +251,9 @@ Current artifacts:
 - Copilot adapter has opt-in live tests
 - CLI can select fake or Copilot backend
 - CLI stdio MCP integration test exists
+- CLI daemon start/status/stop integration test exists
+- MCP inbox acknowledgement tool exists
+- broker restart reattach/interruption behavior is tested
+- turn cancellation cancels pending requests
 - live Copilot stdio MCP integration test exists
 - full Rust validation gate passes

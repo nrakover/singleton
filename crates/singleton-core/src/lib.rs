@@ -26,6 +26,7 @@ pub const FAKE_BACKEND_ID: &str = "fake";
 pub const DEFAULT_MCP_TOOLS: &[&str] = &[
     "get_capabilities",
     "get_inbox",
+    "ack_inbox",
     "ensure_workspace",
     "create_session",
     "send_message",
@@ -327,6 +328,7 @@ pub struct BackendCapabilities {
     pub backend_id: BackendId,
     pub display_name: String,
     pub supports_resume: bool,
+    pub supports_turn_reattach: bool,
     pub supports_cancel: bool,
     pub supports_permissions: bool,
 }
@@ -385,6 +387,15 @@ pub trait AgentBackend: Send + Sync {
     ) -> Result<BackendTurn>;
 
     async fn cancel_turn(&self, session: &BackendSession, turn_id: BackendTurnId) -> Result<()>;
+
+    async fn reattach_turn(
+        &self,
+        _session: &BackendSession,
+        _turn: &Turn,
+        _event_sink: BackendEventSink,
+    ) -> Result<Option<BackendTurn>> {
+        Ok(None)
+    }
 }
 
 #[async_trait]
@@ -551,8 +562,9 @@ mod tests {
 
     #[test]
     fn default_tool_profile_stays_small() {
-        assert_eq!(DEFAULT_MCP_TOOLS.len(), 11);
+        assert_eq!(DEFAULT_MCP_TOOLS.len(), 12);
         assert!(DEFAULT_MCP_TOOLS.contains(&"get_inbox"));
+        assert!(DEFAULT_MCP_TOOLS.contains(&"ack_inbox"));
         assert!(DEFAULT_MCP_TOOLS.contains(&"close_resource"));
     }
 }

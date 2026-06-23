@@ -78,6 +78,7 @@ Coverage:
 - `send_message` is asynchronous and returns a turn id
 - `read_events(wait_ms=...)` replaces a separate wait tool
 - `resolve_request` handles approve, deny, respond, and cancel
+- `ack_inbox` idempotently marks unread completed/failed turn items as read
 - `close_resource` is idempotent
 
 Tests should run against an in-process broker with fake backend/host.
@@ -149,11 +150,15 @@ Crate: `singleton-cli`
 Coverage:
 
 - `singleton serve --backend fake --stdio` starts a JSON-RPC MCP server
+- default stdio mode proxies to a daemon so proxy disconnect does not stop
+  broker-owned turns
 - `singleton serve --backend copilot` selects the Copilot backend
 - ignored live test validates `singleton serve --backend copilot --stdio`
   through the MCP wire protocol
 - `singleton status` reads broker state
-- `singleton stop` requests shutdown
+- `singleton start`, `singleton status`, and `singleton stop` manage pid/socket
+  daemon lifecycle
+- `singleton mcp-config --backend copilot` prints an MCP server config snippet
 - stdio `initialize`, `tools/list`, and `tools/call` work against the fake
   backend for a create/send/read-events vertical slice
 - CLI output is human-readable and stable enough for smoke tests
@@ -174,8 +179,9 @@ These scenarios should run with fake backend and temporary local workspaces.
 4. Call `send_message`.
 5. Fake backend emits deltas and completion.
 6. Call `read_events` until completion.
-7. Close session.
-8. Delete workspace explicitly.
+7. Call `get_inbox` and `ack_inbox` for the unread completion.
+8. Close session.
+9. Delete workspace explicitly.
 
 ### 3.2 Parallel fan-in
 
@@ -186,6 +192,7 @@ These scenarios should run with fake backend and temporary local workspaces.
 5. Assert completed, failed, and input items are represented.
 6. Resolve the input request.
 7. Assert the resolved event is appended.
+8. Cancel a needs-input turn and assert pending requests are cancelled.
 
 ### 3.3 Resume after restart
 
@@ -193,10 +200,13 @@ These scenarios should run with fake backend and temporary local workspaces.
 2. Persist events and active state.
 3. Drop broker instance.
 4. Reopen broker with the same SQLite database.
-5. Assert `list_sessions`, `get_session`, and `read_events` recover state.
-6. Queued/running turns from the previous broker process are marked failed and
-   unread with an interrupted/retryable event unless the backend can reattach
-   them explicitly in a future enhancement.
+5. Assert persisted backend sessions are resumed when the backend supports
+   resume.
+6. Assert active turns are reattached when the backend supports active-turn
+   reattach.
+7. Assert active turns are marked failed/unread with an interrupted/retryable
+   event when the backend cannot reattach the turn, and pending requests for
+   that turn are cancelled.
 
 ### 3.4 Backend state missing
 

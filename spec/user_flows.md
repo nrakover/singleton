@@ -105,8 +105,8 @@ Find all background sessions that need attention.
    - permission request: ask the user or apply policy, then call
      `resolve_request`
    - input request: collect an answer, then call `resolve_request`
-   - failed turn: inspect session/events and optionally retry
-   - completed turn: read final events and summarize
+   - failed turn: inspect session/events, optionally retry, then `ack_inbox`
+   - completed turn: read final events, summarize, then `ack_inbox`
    - stale session: inspect or close the session
 4. Foreground agent repeats until there are no blocking items.
 
@@ -115,6 +115,8 @@ Find all background sessions that need attention.
 - `get_inbox` is concise enough to call often.
 - It does not return large transcripts or diffs.
 - Inbox items include ids needed for follow-up tools.
+- `ack_inbox` clears handled unread turn items without closing sessions or
+  mutating backend transcripts.
 
 ---
 
