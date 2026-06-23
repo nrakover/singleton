@@ -1,12 +1,8 @@
 # singleton
 
-`singleton` is being redesigned as a durable background agent session broker.
-It will expose a compact MCP server that any capable foreground agent can use
-to create, message, monitor, and clean up long-lived background agent sessions.
-
-The previous Python/Claude hub implementation in this repository is now
-historical reference. Current design work targets a Rust daemon backed first by
-the GitHub Copilot SDK.
+`singleton` is a durable background agent session broker. It exposes a compact
+MCP server that any capable foreground agent can use to create, message,
+monitor, and clean up long-lived background agent sessions.
 
 ## Product direction
 
@@ -66,9 +62,9 @@ runtime dependency.
 
 ## Development status
 
-The repository now contains the first Rust broker slice: a Cargo workspace,
+The repository contains the Rust broker implementation: a Cargo workspace,
 SQLite store, local host/worktree connector, fake backend, rmcp-backed MCP tool
-surface, Copilot SDK adapter, and thin CLI. See:
+surface, Copilot SDK adapter, daemon-backed CLI, and tests. See:
 
 - `spec/spec.md`
 - `spec/interfaces.md`
@@ -78,9 +74,6 @@ surface, Copilot SDK adapter, and thin CLI. See:
 - `docs/foreground-agent-coordination.md`
 - `docs/remote-host-fast-follow.md`
 - `AGENTS.md`
-
-The old Python code, tests, hook scripts, and slash-command docs remain for
-reference until the Rust replacement is implemented.
 
 ## CLI smoke usage
 

@@ -333,7 +333,8 @@ events.
 
 ## 8. Rust Toolchain
 
-The implementation target is Rust, replacing the current Python/uv prototype.
+The implementation target is Rust; the superseded Python/uv prototype has been
+removed from the active repository surface.
 
 Baseline:
 

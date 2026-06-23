@@ -3,7 +3,7 @@
 ## 1. Scope
 
 The current behavioral target is the Rust MCP session broker. The previous
-Python pytest suite is historical reference while the rewrite is underway.
+Python pytest suite has been removed with the legacy prototype.
 
 The new verification gate is:
 

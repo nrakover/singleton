@@ -2,10 +2,9 @@
 
 ## Current Direction
 
-`singleton` is being reset into a Rust-based MCP session broker for durable
-background agent sessions. The previous Python/Claude hub, worker, hook, and
-TUI architecture is historical reference unless a task explicitly asks for
-legacy maintenance.
+`singleton` is a Rust-based MCP session broker for durable background agent
+sessions. Historical Python/Claude planning docs may remain for context, but
+the executable implementation is the Rust/Copilot broker.
 
 Primary references:
 
@@ -15,9 +14,9 @@ Primary references:
 - `spec/tests.md`
 - `project_tasks/2_agent-session-mcp-pivot.md`
 
-Copilot CLI/app is the working environment going forward. Legacy Claude Code
-artifacts may be useful for historical context, but they are not authoritative
-and should not be kept in sync.
+Copilot CLI/app is the working environment going forward. Claude Code artifacts
+are not authoritative and should not be reintroduced unless a task explicitly
+asks for legacy archaeology.
 
 ## Verification Commands
 
@@ -35,30 +34,14 @@ Live Copilot-backed tests are opt-in:
 cargo test --workspace --features live-copilot -- --ignored
 ```
 
-While legacy Python code remains in the repository, use the old Python gate
-only for tasks that intentionally modify that code:
-
-```bash
-uv run pytest
-uv run ruff format .
-uv run ruff check src/ tests/
-uv run ty check
-```
-
 Documentation-only design reset work does not require running either gate.
 
 ## Project Structure
 
-Current/historical:
+Current:
 
-- `src/singleton/` - legacy Python prototype
-- `tests/` - legacy pytest suite
-- `hooks/` - legacy Claude hook scripts
 - `spec/` - canonical current behavioral spec
 - `project_tasks/` - implementation plans and backlog
-
-Planned Rust workspace:
-
 - `crates/singleton-core`
 - `crates/singleton-store`
 - `crates/singleton-copilot`
@@ -98,5 +81,5 @@ When changing behavior, update all relevant current artifacts:
 4. `spec/tests.md` if validation strategy or expected behavior changes
 5. `project_tasks/2_agent-session-mcp-pivot.md` or `project_tasks/backlog.md`
 
-Do not extend the superseded Python hub/worker architecture unless the task is
-explicitly scoped as legacy maintenance.
+Do not recreate or extend the superseded Python hub/worker architecture unless
+the task is explicitly scoped as legacy archaeology.

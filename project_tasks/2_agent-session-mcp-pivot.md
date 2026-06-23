@@ -11,9 +11,9 @@ This task supersedes both prior implementation plans:
 - `project_tasks/0_bootstrap.md`
 - `project_tasks/1_streamed-architecture-reset.md`
 
-The old Python/Claude hub implementation remains useful as historical
-reference, but new implementation work should target the Rust MCP broker
-specified in `spec/`.
+The old Python/Claude hub implementation is superseded. Historical planning
+docs are retained for context, but implementation work should target the Rust
+MCP broker specified in `spec/`.
 
 ---
 
@@ -57,7 +57,7 @@ tools.
 
 - second real agent backend
 - daemon-owned hub TUI
-- Python hub/worker extension work
+- recreating the superseded Python hub/worker implementation
 - SSH/cloud execution
 - runtime AHP dependency
 - full transcript/context manager
