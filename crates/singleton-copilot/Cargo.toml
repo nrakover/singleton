@@ -1,0 +1,22 @@
+[package]
+name = "singleton-copilot"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+live-copilot = ["github-copilot-sdk/bundled-cli"]
+
+[dependencies]
+async-trait.workspace = true
+github-copilot-sdk.workspace = true
+serde_json.workspace = true
+singleton-core = { path = "../singleton-core" }
+singleton-store = { path = "../singleton-store" }
+tokio.workspace = true
+
+[lints]
+workspace = true

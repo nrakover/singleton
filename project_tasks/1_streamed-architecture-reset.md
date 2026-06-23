@@ -1,5 +1,11 @@
 # Task 1: Streamed Architecture Reset
 
+> Superseded by `project_tasks/2_agent-session-mcp-pivot.md`.
+>
+> This file is retained as historical context for the previous Python/Claude
+> hub reset. Do not extend this architecture for new implementation work unless
+> the current task explicitly asks for legacy maintenance.
+
 ## Objective
 
 Replace the bootstrap architecture with a cleaner split between a daemon-owned streamed hub session and durable, one-run-per-process worker sessions. Preserve the product behavior where appropriate, but rewrite the implementation around direct Python hooks, SQLite-backed worker coordination, JSONL session logs, and a singleton-owned multi-attach TUI.

@@ -1,0 +1,35 @@
+[package]
+name = "singleton-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+live-copilot = ["singleton-copilot/live-copilot"]
+
+[[bin]]
+name = "singleton"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+singleton-broker = { path = "../singleton-broker" }
+singleton-copilot = { path = "../singleton-copilot" }
+singleton-core = { path = "../singleton-core" }
+singleton-host = { path = "../singleton-host" }
+singleton-mcp = { path = "../singleton-mcp" }
+singleton-store = { path = "../singleton-store" }
+singleton-test-support = { path = "../singleton-test-support" }
+tokio.workspace = true
+tracing-subscriber.workspace = true
+rmcp.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,158 +1,260 @@
-# singleton - Test Inventory
+# singleton - Test Strategy
 
-Derived from the rewritten spec. Tests should favor small protocols and fake implementations over magic mocks.
+## 1. Scope
 
----
+The current behavioral target is the Rust MCP session broker. The previous
+Python pytest suite has been removed with the legacy prototype.
 
-## T-REPO: SQLite repositories (`test_store.py`)
+The new verification gate is:
 
-| ID | Description | Type |
-|---|---|---|
-| T-REPO-1 | Schema bootstrap creates `threads`, `runs`, and `messages` tables | unit |
-| T-REPO-2 | `create_thread` persists default worker cwd when `cwd=None` | unit |
-| T-REPO-3 | `create_run` persists a run row before process launch | unit |
-| T-REPO-4 | `append_message` persists `direction`, `message_type`, `thread_id`, `run_id`, and payload JSON | unit |
-| T-REPO-5 | Updating `threads.session_id` touches only sparse metadata fields | unit |
-| T-REPO-6 | Updating `runs.pid`, `runs.finished_at`, and `runs.exit_code` leaves other durable data untouched | unit |
-| T-REPO-7 | `list_pending_approvals` derives unresolved requests from `permission_request` minus matching `permission_resolution` | unit |
-| T-REPO-8 | `get_thread_events` paginates newest-first durable messages for one thread | unit |
-| T-REPO-9 | Concurrent append-heavy message writes do not corrupt SQLite state | unit |
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets
+```
 
----
+Live Copilot tests must be opt-in:
 
-## T-HOOKS: Direct Python hooks (`test_hooks.py`)
-
-| ID | Description | Type |
-|---|---|---|
-| T-HOOKS-1 | `SessionStart` hook writes `run_started` with `session_id` and `run_id` | unit |
-| T-HOOKS-2 | `PermissionRequest` hook writes `permission_request` with tool input and suggestions | unit |
-| T-HOOKS-3 | `PermissionRequest` hook returns allow when matching `permission_resolution` is approved | unit |
-| T-HOOKS-4 | `PermissionRequest` hook returns deny with freeform reason when matching resolution is denied | unit |
-| T-HOOKS-5 | `PermissionRequest` hook times out safely when no resolution arrives | unit |
-| T-HOOKS-6 | `Stop` hook writes `run_finished` with `outcome=completed` and `last_assistant_message` | unit |
-| T-HOOKS-7 | `StopFailure` hook writes `run_finished` with `outcome=api_error`, `error`, and `error_details` | unit |
-| T-HOOKS-8 | `Notification` hook writes `notification` message | unit |
+```bash
+cargo test --workspace --features live-copilot -- --ignored
+```
 
 ---
 
-## T-WORKER: Worker session manager (`test_worker.py`)
+## 2. Test Layers
 
-| ID | Description | Type |
-|---|---|---|
-| T-WORKER-1 | New run row is created before worker spawn | unit |
-| T-WORKER-2 | Spawn command injects direct Python hooks instead of bash wrapper scripts | unit |
-| T-WORKER-3 | Spawn command includes `SINGLETON_THREAD_ID` and `SINGLETON_RUN_ID` env vars | unit |
-| T-WORKER-4 | Follow-up run uses `--resume <session_id>` when thread metadata contains one | unit |
-| T-WORKER-5 | `yolo` mode uses Claude-native bypass permissions while other modes do not | unit |
-| T-WORKER-6 | Stdout stream is teed to `{run_id}.stdout.jsonl` | unit |
-| T-WORKER-7 | Stderr stream is teed to `{run_id}.stderr.jsonl` | unit |
-| T-WORKER-8 | Abnormal subprocess exit without `run_finished` is reconciled as fallback failure state | integration |
-| T-WORKER-9 | Worker run updates `threads.session_id` from hook-authored lifecycle data | integration |
+### 2.1 Core unit tests
+
+Crate: `singleton-core`
+
+Coverage:
+
+- id and resource URI creation
+- host/workspace/session/chat/turn/request state transitions
+- close/disposition rules
+- request resolution semantics
+- event cursor ordering
+- error mapping and validation
+- capability model serialization
+
+Required properties:
+
+- no duplicate resource URIs
+- invalid transitions fail explicitly
+- idempotent close operations remain idempotent
+- destructive workspace deletion requires explicit disposition and no active
+  references unless forced
+
+### 2.2 Store tests
+
+Crate: `singleton-store`
+
+Coverage:
+
+- migrations apply from an empty database
+- hosts/workspaces/sessions/chats/turns/requests can be created and read back
+- singleton intents are persisted before backend dispatch
+- events get monotonic `server_seq` values
+- `read_events` respects cursor, target resource, limit, type filter, and wait
+  timeout
+- request resolution is atomic
+- archived/deleted resources remain queryable enough for audit and idempotency
+- daemon restart can reconstruct active state from SQLite
+
+Use temporary SQLite databases. Do not depend on user home directories.
+
+### 2.3 MCP contract tests
+
+Crate: `singleton-mcp`
+
+Coverage:
+
+- each default tool has stable input/output schema
+- invalid inputs return machine-readable errors
+- `get_capabilities` is compact and complete
+- `get_inbox` returns counts plus actionable items, not transcripts
+- `create_session` resolves inline workspaces through the same code path as
+  `ensure_workspace`
+- `send_message` is asynchronous and returns a turn id
+- `read_events(wait_ms=...)` replaces a separate wait tool
+- `resolve_request` handles approve, deny, respond, and cancel
+- `ack_inbox` idempotently marks unread completed/failed turn items as read
+- `close_resource` is idempotent
+
+Tests should run against an in-process broker with fake backend/host.
+
+### 2.4 Fake backend tests
+
+Crate: `singleton-test-support`
+
+Coverage:
+
+- deterministic session creation/resume
+- streaming message deltas
+- successful turn completion
+- failed turn
+- cancellation
+- permission request
+- input request
+- backend disappearance/degraded session
+
+The fake backend is required so most broker tests do not depend on real
+Copilot credentials, network, or model behavior.
+
+### 2.5 Copilot adapter tests
+
+Crate: `singleton-copilot`
+
+Default tests:
+
+- configuration validation
+- backend id mapping
+- provider error mapping
+- event normalization for recorded/fake SDK fixtures
+- permission/input handler plumbing using test doubles where possible
+
+Ignored live tests:
+
+- create a real Copilot session
+- send a message and stream events
+- drive `singleton serve --backend copilot --stdio` over MCP initialize,
+  create-session, send-message, and read-events
+- resume a real session
+- cancel a running turn when supported
+- surface and resolve a permission request
+
+Live tests must require an explicit feature flag and environment setup. They
+must never run in the default CI gate.
+
+### 2.6 Host/workspace tests
+
+Crate: `singleton-host`
+
+Coverage:
+
+- local path workspace resolution
+- git worktree creation from a local repo
+- branch/base-ref metadata
+- cleanup policies: keep, delete on archive, delete on success
+- refusing destructive delete with active session references
+- forced cleanup behavior
+- cleanup idempotency
+- error behavior for invalid repo/path/base ref
+
+Use temporary git repositories created by tests.
+
+### 2.7 CLI tests
+
+Crate: `singleton-cli`
+
+Coverage:
+
+- `singleton serve --backend fake --stdio` starts a JSON-RPC MCP server
+- default stdio mode proxies to a daemon so proxy disconnect does not stop
+  broker-owned turns
+- `singleton serve --backend copilot` selects the Copilot backend
+- ignored live test validates `singleton serve --backend copilot --stdio`
+  through the MCP wire protocol
+- `singleton status` reads broker state
+- `singleton start`, `singleton status`, and `singleton stop` manage pid/socket
+  daemon lifecycle
+- `singleton mcp-config --backend copilot` prints an MCP server config snippet
+- stdio `initialize`, `tools/list`, and `tools/call` work against the fake
+  backend for a create/send/read-events vertical slice
+- CLI output is human-readable and stable enough for smoke tests
+
+CLI tests should avoid depending on long-running external services.
 
 ---
 
-## T-HUB: Hub controller (`test_hub.py`)
+## 3. End-to-End MVP Scenarios
 
-| ID | Description | Type |
-|---|---|---|
-| T-HUB-1 | Hub process launches as daemon-owned long-lived streamed session | unit |
-| T-HUB-2 | Hub controller writes prompts to hub stdin and receives streamed output in memory | unit |
-| T-HUB-3 | Hub MCP config is written to `.mcp.json`, not `settings.json` | unit |
-| T-HUB-4 | Singleton MCP tools are pre-allowed in hub settings | unit |
+These scenarios should run with fake backend and temporary local workspaces.
 
----
+### 3.1 Fresh worktree session
 
-## T-DAEMON: Daemon state and recovery (`test_daemon.py`)
+1. Create a temporary git repo.
+2. Call `create_session` with inline `git_worktree`.
+3. Assert workspace and session records exist.
+4. Call `send_message`.
+5. Fake backend emits deltas and completion.
+6. Call `read_events` until completion.
+7. Call `get_inbox` and `ack_inbox` for the unread completion.
+8. Close session.
+9. Delete workspace explicitly.
 
-| ID | Description | Type |
-|---|---|---|
-| T-DAEMON-1 | Daemon writes `daemon.pid` and binds `daemon.sock` on start | unit |
-| T-DAEMON-2 | Daemon serves MCP on configured port | unit |
-| T-DAEMON-3 | Daemon rebuilds unresolved permission requests from SQLite on restart | integration |
-| T-DAEMON-4 | Daemon restart does not require worker subprocesses to stop first | integration |
-| T-DAEMON-5 | Worker hooks continue appending durable messages while daemon is down | integration |
-| T-DAEMON-6 | Daemon surfaces `run_finished` from hook-authored messages rather than stdout parsing | integration |
-| T-DAEMON-7 | `approve_tool_call` appends `permission_resolution` and unblocks the hook | integration |
-| T-DAEMON-8 | `deny_tool_call` appends `permission_resolution` with reason and blocks the hook | integration |
-| T-DAEMON-9 | Daemon rebuilds canonical runtime state from durable worker-plane data for fresh attaches | integration |
+### 3.2 Parallel fan-in
 
----
+1. Create three sessions.
+2. Send three turns.
+3. Fake backend completes one, fails one, and requests input for one.
+4. Call `get_inbox`.
+5. Assert completed, failed, and input items are represented.
+6. Resolve the input request.
+7. Assert the resolved event is appended.
+8. Cancel a needs-input turn and assert pending requests are cancelled.
 
-## T-TUI: Multi-attach rendering (`test_tui.py`)
+### 3.3 Resume after restart
 
-| ID | Description | Type |
-|---|---|---|
-| T-TUI-1 | Multiple attached clients receive mirrored rendered state | integration |
-| T-TUI-2 | Exactly one client owns freeform hub input at a time | integration |
-| T-TUI-3 | Non-owning clients can observe but not type into the hub | integration |
-| T-TUI-4 | Control handoff updates ownership cleanly | integration |
-| T-TUI-5 | Passthrough approval is routed to the active input owner | integration |
-| T-TUI-6 | Detach removes only that client, not daemon or hub state | integration |
+1. Create session and turn.
+2. Persist events and active state.
+3. Drop broker instance.
+4. Reopen broker with the same SQLite database.
+5. Assert persisted backend sessions are resumed when the backend supports
+   resume.
+6. Assert active turns are reattached when the backend supports active-turn
+   reattach.
+7. Assert active turns are marked failed/unread with an interrupted/retryable
+   event when the backend cannot reattach the turn, and pending requests for
+   that turn are cancelled.
 
----
+### 3.4 Backend state missing
 
-## T-MCP: MCP behavior (`test_mcp.py`)
+1. Create a session with backend id mapping.
+2. Restart broker.
+3. Fake backend reports missing backend session.
+4. Assert singleton marks the session degraded/broken.
+5. Assert it does not reconstruct the backend transcript from normalized
+   events.
 
-| ID | Description | Type |
-|---|---|---|
-| T-MCP-1 | `create_thread` returns `{thread_id}` and persists durable thread metadata | integration |
-| T-MCP-2 | `send_to_thread` creates a run and returns terminal summary from `run_finished` | integration |
-| T-MCP-3 | `thread_output` paginates JSONL-backed run output correctly | integration |
-| T-MCP-4 | `get_thread_events` returns durable lifecycle messages newest-first | integration |
-| T-MCP-5 | `set_thread_permissions` updates future-run permission mode | unit |
-| T-MCP-6 | `list_pending_approvals` returns unresolved permission requests only | integration |
-| T-MCP-7 | `deny_tool_call(request_id, reason)` persists deny reason for hook consumption | integration |
-| T-MCP-8 | `cancel_thread` cancels the active run for a thread when one exists | integration |
+### 3.5 Workspace cleanup safety
 
----
-
-## T-MANUAL: Manual verification gate
-
-These checks are intentionally manual because they rely on real terminal behavior, real Claude Code process interaction, or multi-client UX details that are difficult to verify programmatically with acceptable confidence.
-
-These manual checks must be re-run by the coding agent before marking any major implementation task complete, in addition to the required automated validation commands.
-
-| ID | Description | Type |
-|---|---|---|
-| T-MANUAL-1 | Real `singleton` attach launches the daemon, hub, and TUI cleanly in a real terminal | manual |
-| T-MANUAL-2 | Real `Ctrl+b d` detaches only the current client and leaves daemon state intact | manual |
-| T-MANUAL-3 | Real multi-attach mirrors state across two terminals and enforces single input ownership | manual |
-| T-MANUAL-4 | Real passthrough permission prompt is routed to the active input owner and returns the decision to Claude | manual |
-| T-MANUAL-5 | Real daemon crash/restart preserves in-flight worker durability through SQLite and logs | manual |
+1. Create one workspace shared by two sessions.
+2. Close one session.
+3. Attempt workspace delete without force.
+4. Assert delete fails because one active session remains.
+5. Close second session.
+6. Delete workspace.
+7. Repeat delete and assert idempotent success.
 
 ---
 
-## T-CLI: Manual behavior
+## 4. AHP Alignment Tests
 
-| ID | Description | Type |
-|---|---|---|
-| T-CLI-1 | `singleton` starts daemon and attaches when not running | manual |
-| T-CLI-2 | `singleton attach` adds a second mirrored client | manual |
-| T-CLI-3 | `singleton status` prints thread and approval summary without attaching | manual |
-| T-CLI-4 | `Ctrl+b d` detaches only the current client | manual |
-| T-CLI-5 | Input ownership can be handed from one terminal to another | manual |
+AHP is not an MVP runtime dependency, but internal state should be projectable
+into AHP-like resource snapshots and action streams.
 
----
+Use tests that do not import AHP crates:
 
-## T-FLOWS: End-to-end flows
+- root snapshot includes hosts, capabilities, and resource links
+- session snapshot includes chats, turns, status, and workspace reference
+- changeset snapshot includes metadata and resource URI
+- event sequences can be replayed from a cursor
+- reconnect can request events after last seen sequence
 
-| ID | Flow | Covers |
-|---|---|---|
-| T-FLOWS-1 | UF-1 setup and launch | setup, daemon, hub, TUI |
-| T-FLOWS-2 | UF-3 start work on a thread | run creation, worker spawn, completion |
-| T-FLOWS-3 | UF-4 supervised permission request | `PermissionRequest`, MCP approval |
-| T-FLOWS-4 | UF-5 passthrough permission request | active-owner routing |
-| T-FLOWS-5 | UF-9 follow-up run resumes prior session | `session_id` continuity |
-| T-FLOWS-6 | UF-11 multi-attach ownership handoff | TUI ownership rules |
-| T-FLOWS-7 | UF-12 daemon crash while worker continues | recovery from SQLite + logs |
+If an optional AHP adapter is added later, put protocol-specific tests behind a
+feature flag.
 
 ---
 
-## Coverage Notes
+## 5. Legacy Python Tests
 
-- `spec/spec.md` sections 2-8 are covered by T-REPO, T-HOOKS, T-WORKER, T-HUB, T-DAEMON, T-TUI, and T-MCP.
-- `spec/spec.md` sections 3 and the real-terminal aspects of sections 6-8 also require the T-MANUAL gate.
-- Every major task completion requires:
-  - all automated validation commands to pass
-  - all relevant automated tests for the changed scope to pass
-  - the T-MANUAL checks that exercise changed real-terminal or real-Claude behavior to be re-verified
+The existing Python tests document useful prior behavior but are not the target
+verification gate for the Rust broker. During migration:
+
+- keep them available for reference until equivalent Rust tests exist
+- do not add new behavior to the old Python daemon/hub contracts
+- do not treat old placeholder failures as blockers for doc-only design reset
+  work
+- remove or archive Python tests only in a dedicated cleanup change after Rust
+  replacement coverage exists
