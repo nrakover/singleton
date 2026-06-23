@@ -1,0 +1,19 @@
+[package]
+name = "singleton-store"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+singleton-core = { path = "../singleton-core" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

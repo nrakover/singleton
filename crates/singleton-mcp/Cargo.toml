@@ -1,0 +1,25 @@
+[package]
+name = "singleton-mcp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rmcp.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+singleton-broker = { path = "../singleton-broker" }
+singleton-core = { path = "../singleton-core" }
+
+[dev-dependencies]
+singleton-host = { path = "../singleton-host" }
+singleton-store = { path = "../singleton-store" }
+singleton-test-support = { path = "../singleton-test-support" }
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

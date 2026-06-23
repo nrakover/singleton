@@ -98,5 +98,8 @@ dmypy.json
 # Ruff
 .ruff_cache/
 
+# Rust
+target/
+
 # PyPI
 .pypirc
