@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+log() {
+  printf 'singleton plugin: %s\n' "$*" >&2
+}
+
+target_triple() {
+  local os arch
+  os="$(uname -s)"
+  arch="$(uname -m)"
+  case "${os}:${arch}" in
+    Darwin:x86_64)
+      printf 'x86_64-apple-darwin'
+      ;;
+    Darwin:arm64|Darwin:aarch64)
+      printf 'aarch64-apple-darwin'
+      ;;
+    Linux:x86_64|Linux:amd64)
+      printf 'x86_64-unknown-linux-gnu'
+      ;;
+    *)
+      log "unsupported platform ${os}/${arch}; install singleton manually and set SINGLETON_BINARY"
+      return 1
+      ;;
+  esac
+}
+
+release_base_url() {
+  if [[ -n "${SINGLETON_RELEASE_BASE_URL:-}" ]]; then
+    printf '%s' "${SINGLETON_RELEASE_BASE_URL}"
+  elif [[ -n "${SINGLETON_VERSION:-}" ]]; then
+    printf 'https://github.com/nrakover/singleton/releases/download/%s' "${SINGLETON_VERSION}"
+  else
+    printf 'https://github.com/nrakover/singleton/releases/latest/download'
+  fi
+}
+
+verify_checksum() {
+  local directory checksum_file
+  directory="$1"
+  checksum_file="$2"
+  if command -v shasum >/dev/null 2>&1; then
+    (cd "${directory}" && shasum -a 256 -c "${checksum_file}") >&2
+  elif command -v sha256sum >/dev/null 2>&1; then
+    (cd "${directory}" && sha256sum -c "${checksum_file}") >&2
+  else
+    log "neither shasum nor sha256sum is available; skipping checksum verification"
+  fi
+}
+
+install_singleton() {
+  local target base_url archive checksum temp_dir found_binary
+  target="$(target_triple)"
+  base_url="$(release_base_url)"
+  archive="singleton-${target}.tar.gz"
+  checksum="${archive}.sha256"
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "${temp_dir}"; trap - RETURN' RETURN
+
+  log "installing ${archive} from ${base_url}"
+  curl -fsSL "${base_url}/${archive}" -o "${temp_dir}/${archive}"
+  curl -fsSL "${base_url}/${checksum}" -o "${temp_dir}/${checksum}"
+  verify_checksum "${temp_dir}" "${checksum}"
+  tar -xzf "${temp_dir}/${archive}" -C "${temp_dir}"
+  found_binary="$(find "${temp_dir}" -type f -name singleton -print -quit)"
+  if [[ -z "${found_binary}" ]]; then
+    log "release archive did not contain a singleton binary"
+    return 1
+  fi
+  mkdir -p "${SINGLETON_PLUGIN_BIN_DIR}"
+  install -m 0755 "${found_binary}" "${SINGLETON_PLUGIN_BINARY}"
+}
+
+select_singleton_binary() {
+  if [[ -n "${SINGLETON_BINARY:-}" ]]; then
+    printf '%s' "${SINGLETON_BINARY}"
+    return
+  fi
+
+  if [[ "${SINGLETON_FORCE_INSTALL:-0}" == "1" || ! -x "${SINGLETON_PLUGIN_BINARY}" ]]; then
+    if ! install_singleton; then
+      if command -v singleton >/dev/null 2>&1; then
+        log "release install failed; falling back to singleton from PATH"
+        command -v singleton
+        return
+      fi
+      return 1
+    fi
+  fi
+  printf '%s' "${SINGLETON_PLUGIN_BINARY}"
+}
+
+data_dir="${COPILOT_PLUGIN_DATA:-${CLAUDE_PLUGIN_DATA:-${HOME}/.singleton/copilot-plugin}}"
+SINGLETON_PLUGIN_BIN_DIR="${data_dir}/bin"
+SINGLETON_PLUGIN_BINARY="${SINGLETON_PLUGIN_BIN_DIR}/singleton"
+singleton_binary="$(select_singleton_binary)"
+args=(serve --stdio --backend "${SINGLETON_BACKEND:-copilot}")
+if [[ -n "${SINGLETON_DATABASE:-}" ]]; then
+  args+=(--database "${SINGLETON_DATABASE}")
+fi
+exec "${singleton_binary}" "${args[@]}" "$@"

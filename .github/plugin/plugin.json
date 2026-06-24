@@ -1,0 +1,9 @@
+{
+  "name": "singleton",
+  "description": "Durable MCP broker for background agent sessions.",
+  "version": "0.1.0",
+  "repository": "https://github.com/nrakover/singleton",
+  "license": "MIT",
+  "keywords": ["mcp", "agents", "sessions", "copilot"],
+  "mcpServers": "mcp.json"
+}

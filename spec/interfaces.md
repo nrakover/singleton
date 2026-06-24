@@ -11,6 +11,45 @@ not the primary product UX.
 
 ---
 
+## 1.1 CLI admin and installer commands
+
+The `singleton` binary exposes these public commands:
+
+| Command | Purpose |
+|---|---|
+| `serve --stdio` | Foreground-agent MCP entrypoint; starts/reuses the daemon and proxies stdio to its Unix socket. |
+| `serve --stdio --direct` | Debug MCP server with broker in the foreground. |
+| `serve --daemon` | Internal daemon process entrypoint; fails if the daemon socket is already owned. |
+| `start` | Idempotently start/reuse the daemon for a selected database/backend. |
+| `status` | Print daemon state, database path, socket path, and sessions. |
+| `stop` | Stop the daemon and clean stale pid/socket files. |
+| `mcp-config` | Print a JSON MCP server snippet for manual client configuration. |
+| `install-mcp` | Register singleton with a supported MCP client using that client's native command. |
+
+`install-mcp` inputs:
+
+| Option | Values/default | Purpose |
+|---|---|---|
+| `--client` | `copilot`, `claude`, `codex` | Required target client. |
+| `--name` | `singleton` | MCP server name to register. |
+| `--backend` | `copilot` | Backend passed to `serve --stdio`. |
+| `--database` | omitted | Optional singleton SQLite database path. |
+| `--binary` | current executable | Binary path to register. |
+| `--dry-run` | false | Print the native install command without executing it. |
+
+Generated command shapes:
+
+```bash
+copilot mcp add NAME -- BINARY serve --stdio --backend BACKEND
+claude mcp add --transport stdio NAME -- BINARY serve --stdio --backend BACKEND
+codex mcp add NAME -- BINARY serve --stdio --backend BACKEND
+```
+
+When `--database PATH` is provided, append `--database PATH` to the MCP server
+command after the backend arguments.
+
+---
+
 ## 2. Resource Identity
 
 Every durable entity has both an ordinary id and a stable resource URI. MCP

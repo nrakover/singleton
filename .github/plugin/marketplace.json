@@ -1,0 +1,21 @@
+{
+  "name": "singleton",
+  "owner": {
+    "name": "nrakover"
+  },
+  "metadata": {
+    "description": "Durable MCP broker for background agent sessions.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "singleton",
+      "description": "Configure singleton as a Copilot CLI MCP server.",
+      "version": "0.1.0",
+      "source": ".github/plugin",
+      "repository": "https://github.com/nrakover/singleton",
+      "license": "MIT",
+      "keywords": ["mcp", "agents", "sessions", "copilot"]
+    }
+  ]
+}

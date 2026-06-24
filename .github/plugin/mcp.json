@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "singleton": {
+      "command": "bash",
+      "args": ["${PLUGIN_ROOT}/bin/singleton-mcp"]
+    }
+  }
+}
