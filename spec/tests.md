@@ -77,6 +77,10 @@ Coverage:
   `ensure_workspace`
 - `send_message` is asynchronous and returns a turn id
 - `read_events(wait_ms=...)` replaces a separate wait tool
+- `get_latest_output` returns compact latest turn results for fake success and
+  failure, reports no-output turns with `needs_event_inspection`, reports
+  no-terminal-turn sessions as typed empty results, and does not change
+  `read_events` cursor semantics
 - `resolve_request` handles approve, deny, respond, and cancel
 - `ack_inbox` idempotently marks unread completed/failed turn items as read
 - `close_resource` is idempotent
@@ -92,6 +96,7 @@ Coverage:
 - deterministic session creation/resume
 - streaming message deltas
 - successful turn completion
+- completed turns with no concise output
 - failed turn
 - cancellation
 - permission request
@@ -209,9 +214,11 @@ These scenarios should run with fake backend and temporary local workspaces.
 4. Call `send_message`.
 5. Fake backend emits deltas and completion.
 6. Call `read_events` until completion.
-7. Call `get_inbox` and `ack_inbox` for the unread completion.
-8. Close session.
-9. Delete workspace explicitly.
+7. Call `get_latest_output` and assert the compact result is available or
+   explicitly requests event inspection.
+8. Call `get_inbox` and `ack_inbox` for the unread completion.
+9. Close session.
+10. Delete workspace explicitly.
 
 ### 3.2 Parallel fan-in
 
@@ -220,9 +227,26 @@ These scenarios should run with fake backend and temporary local workspaces.
 3. Fake backend completes one, fails one, and requests input for one.
 4. Call `get_inbox`.
 5. Assert completed, failed, and input items are represented.
-6. Resolve the input request.
-7. Assert the resolved event is appended.
-8. Cancel a needs-input turn and assert pending requests are cancelled.
+6. Call `get_latest_output` for the completed and failed turns.
+7. Resolve the input request.
+8. Assert the resolved event is appended.
+9. Cancel a needs-input turn and assert pending requests are cancelled.
+
+### 3.2.1 Compact latest output
+
+1. Create one fake session whose turn completes with a terminal summary.
+2. Assert `get_latest_output({ session_id })` returns the completed turn id,
+   `result_text`, `result_source: "turn_summary"`, and
+   `needs_event_inspection: false`.
+3. Create one fake session whose turn fails with a summary.
+4. Assert `get_latest_output({ session_id, turn_id })` returns failed status and
+   the failure text.
+5. Create one fake session whose turn completes without a known output payload.
+6. Assert `get_latest_output` returns `result_text: null`,
+   `result_source: "none"`, and `needs_event_inspection: true`.
+7. Create one session with no turns.
+8. Assert `get_latest_output` returns a typed empty no-turn result and does not
+   fail.
 
 ### 3.3 Resume after restart
 

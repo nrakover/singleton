@@ -111,6 +111,7 @@ fn stdio_mcp_serves_fake_backend_vertical_slice() -> TestResult<()> {
     assert!(tool_names.contains(&"create_session"), "{tools}");
     assert!(tool_names.contains(&"send_message"), "{tools}");
     assert!(tool_names.contains(&"read_events"), "{tools}");
+    assert!(tool_names.contains(&"get_latest_output"), "{tools}");
 
     let capabilities = client.call_tool(3, "get_capabilities", json!({}))?;
     assert_eq!(capabilities["protocol_version"], "0.1");
@@ -156,6 +157,17 @@ fn stdio_mcp_serves_fake_backend_vertical_slice() -> TestResult<()> {
             .any(|event| event["event_type"] == "turn.completed"),
         "{events}"
     );
+    let latest = client.call_tool(
+        7,
+        "get_latest_output",
+        json!({
+            "session_id": created["session_id"],
+            "turn_id": sent["turn_id"]
+        }),
+    )?;
+    assert_eq!(latest["result_text"], "fake turn completed");
+    assert_eq!(latest["result_source"], "turn_summary");
+    assert_eq!(latest["needs_event_inspection"], false);
     Ok(())
 }
 

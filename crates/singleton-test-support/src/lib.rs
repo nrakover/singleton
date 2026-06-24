@@ -12,6 +12,7 @@ use singleton_core::{
 #[derive(Debug, Clone)]
 pub enum FakeTurnBehavior {
     Complete { summary: String },
+    CompleteWithoutOutput,
     Fail { summary: String },
     RequestPermission { summary: String },
     RequestInput { prompt: String },
@@ -119,6 +120,11 @@ impl AgentBackend for FakeBackend {
                     }],
                 }
             }
+            FakeTurnBehavior::CompleteWithoutOutput => BackendTurn {
+                backend_turn_id,
+                status: ResourceStatus::Completed,
+                events: Vec::new(),
+            },
             FakeTurnBehavior::Fail { summary } => BackendTurn {
                 backend_turn_id,
                 status: ResourceStatus::Failed,

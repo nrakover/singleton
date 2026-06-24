@@ -82,7 +82,8 @@ agent sessions.
 6. Foreground agent asks the user about approvals or ambiguous input when
    needed.
 7. Foreground agent calls `resolve_request`.
-8. Foreground agent summarizes completed background work.
+8. Foreground agent calls `get_latest_output` for completed or failed turns and
+   summarizes the compact result.
 9. Foreground agent closes completed sessions and temporary workspaces with
    `close_resource`.
 
@@ -113,9 +114,12 @@ Run a background editing task in an isolated repo checkout.
 5. Singleton persists the turn intent and dispatches it to the backend.
 6. Foreground agent calls `read_events` until the turn completes or requires
    input.
-7. Foreground agent inspects the completion summary and workspace metadata.
-8. Foreground agent decides whether to keep or delete the worktree.
-9. Foreground agent calls `close_resource` for the session and, if appropriate,
+7. Foreground agent calls `get_latest_output` for the completed turn.
+8. If `needs_event_inspection` is true, the foreground agent reads raw turn
+   events with `read_events`.
+9. Foreground agent inspects the compact result and workspace metadata.
+10. Foreground agent decides whether to keep or delete the worktree.
+11. Foreground agent calls `close_resource` for the session and, if appropriate,
    the workspace.
 
 ### Expected behavior
@@ -170,8 +174,9 @@ Find all background sessions that need attention.
    - permission request: ask the user or apply policy, then call
      `resolve_request`
    - input request: collect an answer, then call `resolve_request`
-   - failed turn: inspect session/events, optionally retry, then `ack_inbox`
-   - completed turn: read final events, summarize, then `ack_inbox`
+   - failed turn: call `get_latest_output`, inspect raw events only if needed,
+     optionally retry, then `ack_inbox`
+   - completed turn: call `get_latest_output`, summarize, then `ack_inbox`
    - stale session: inspect or close the session
 4. Foreground agent repeats until there are no blocking items.
 
@@ -182,6 +187,38 @@ Find all background sessions that need attention.
 - Inbox items include ids needed for follow-up tools.
 - `ack_inbox` clears handled unread turn items without closing sessions or
   mutating backend transcripts.
+
+---
+
+## 4.1 Latest Output Retrieval
+
+### Goal
+
+Retrieve the latest useful result for a background turn without scanning raw
+normalized backend event payloads.
+
+### Flow
+
+1. Foreground agent sees a completed, failed, or cancelled turn through
+   `read_events`, `get_inbox`, or `get_session`.
+2. Foreground agent calls `get_latest_output` with `session_id` and optionally
+   `turn_id`.
+3. If `result_text` is present, the foreground agent uses it as the compact turn
+   result.
+4. If `needs_event_inspection` is true, the foreground agent calls
+   `read_events` with the returned `turn_resource_uri` to inspect raw events.
+5. After handling an unread completed or failed turn, the foreground agent calls
+   `ack_inbox`.
+
+### Expected behavior
+
+- Omitting `turn_id` selects the latest completed, failed, or cancelled turn for
+  that session.
+- Sessions with no terminal turn return a typed empty result, not an error.
+- Unknown Copilot SDK payload shapes produce `needs_event_inspection: true`
+  rather than invented result text.
+- `read_events` cursor semantics remain monotonic; latest-output retrieval does
+  not use negative cursors or mutate event read state.
 
 ---
 
@@ -227,7 +264,8 @@ background sessions continue.
 3. It calls `list_sessions` for active/recent sessions.
 4. It calls `get_session` for sessions it wants to resume coordinating.
 5. It uses each session's latest cursor to call `read_events`.
-6. It continues coordination from durable singleton state.
+6. It calls `get_latest_output` for unread completed or failed turns.
+7. It continues coordination from durable singleton state.
 
 ### Expected behavior
 

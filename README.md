@@ -43,6 +43,7 @@ Default MCP tools:
 - `create_session`
 - `send_message`
 - `read_events`
+- `get_latest_output`
 - `list_sessions`
 - `get_session`
 - `resolve_request`

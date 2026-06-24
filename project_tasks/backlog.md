@@ -36,13 +36,12 @@ Completed P0 daemon lifecycle hardening:
 
 Remaining MCP and daemon usability follow-ups:
 
-- Add a compact `get_latest_output` or summarized turn-result field so
-  foreground agents do not need to inspect large raw SDK event payloads to find
-  the final assistant answer.
-- Evaluate whether "latest output" should be a dedicated tool, a `get_session`
-  summary field, or a `read_events` tail mode. Avoid overloading ordinary
-  monotonic cursor semantics unless negative cursor behavior is explicitly
-  specified.
+- Extend `get_latest_output` extraction fixtures as more Copilot SDK event
+  payload shapes are recorded; keep unknown shapes behind
+  `needs_event_inspection` rather than guessing result text.
+- Add a cookbook prompt/config example showing the intended Copilot CLI flow:
+  `get_capabilities`, `create_session`, `send_message`, `read_events`,
+  `get_latest_output`, and `ack_inbox`.
 - Add namespace support for multi-foreground-agent scenarios: default to a
   `default` namespace, allow foreground agents to specify a namespace on tools,
   and scope session lists, inboxes, request resolution, and cleanup by namespace.

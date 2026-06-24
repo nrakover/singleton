@@ -56,8 +56,9 @@ Current:
   deterministic fake backend for tests.
 - The default MCP tool surface must stay compact:
   `get_capabilities`, `get_inbox`, `ack_inbox`, `ensure_workspace`,
-  `create_session`, `send_message`, `read_events`, `list_sessions`,
-  `get_session`, `resolve_request`, `cancel_turn`, `close_resource`.
+  `create_session`, `send_message`, `read_events`, `get_latest_output`,
+  `list_sessions`, `get_session`, `resolve_request`, `cancel_turn`,
+  `close_resource`.
 - A foreground agent acts as the "hub" by convention. Singleton does not own a
   foreground hub session or TUI in the new architecture.
 - Host, workspace, session, chat, turn, request, changeset, terminal, and

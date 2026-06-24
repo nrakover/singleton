@@ -8,9 +8,9 @@ use serde_json::{Value, json};
 use singleton_core::{
     AgentBackend, BackendEvent, BackendMessage, BackendSession, BackendSessionConfig, BackendTurn,
     Capabilities, CapabilityLimits, CleanupSummary, CloseDisposition, DEFAULT_MCP_TOOLS, Event,
-    Inbox, InboxItem, PendingRequest, RequestDecision, RequestKind, ResourceKind, ResourceStatus,
-    Result, Session, SingletonError, TurnId, Workspace, WorkspaceSpec, backend_payload_summary,
-    resource_uri,
+    Inbox, InboxItem, LatestOutput, LatestOutputEventRef, LatestOutputSource, PendingRequest,
+    RequestDecision, RequestKind, ResourceKind, ResourceStatus, Result, Session, SingletonError,
+    Turn, TurnId, Workspace, WorkspaceSpec, backend_payload_summary, resource_uri,
 };
 use singleton_core::{HostConnector, compact_json};
 use singleton_store::{Store, new_request, new_session, new_turn};
@@ -248,6 +248,32 @@ where
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    pub fn get_latest_output(&self, request: GetLatestOutputRequest) -> Result<LatestOutput> {
+        let session = self.store.get_session(&request.session_id)?;
+        let turn = match request.turn_id {
+            Some(turn_id) => {
+                let turn = self.store.get_turn(&turn_id)?;
+                if turn.session_id != session.session_id {
+                    return Err(SingletonError::InvalidInput(format!(
+                        "turn {} does not belong to session {}",
+                        turn.turn_id, session.session_id
+                    )));
+                }
+                Some(turn)
+            }
+            None => self
+                .store
+                .latest_terminal_turn_for_session(&session.session_id)?,
+        };
+        let Some(turn) = turn else {
+            return Ok(no_turn_latest_output(&session));
+        };
+        let events = self
+            .store
+            .read_recent_events_for_resource(&turn.resource_uri, 500)?;
+        Ok(latest_output_from_events(&session, &turn, &events))
     }
 
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
@@ -888,6 +914,156 @@ fn backend_session_from(session: &Session) -> Result<BackendSession> {
     })
 }
 
+fn no_turn_latest_output(session: &Session) -> LatestOutput {
+    LatestOutput {
+        session_id: session.session_id.clone(),
+        turn_id: None,
+        turn_resource_uri: None,
+        status: None,
+        event_cursor: session.latest_event_cursor,
+        source_event: None,
+        result_text: None,
+        result_source: LatestOutputSource::None,
+        needs_event_inspection: false,
+        inspection_hint: Some(
+            "no completed, failed, or cancelled turn exists for this session".to_string(),
+        ),
+    }
+}
+
+fn latest_output_from_events(session: &Session, turn: &Turn, events: &[Event]) -> LatestOutput {
+    let latest_event = events.last().map(latest_output_event_ref);
+    let event_cursor = latest_event
+        .as_ref()
+        .map(|event| event.server_seq)
+        .unwrap_or(session.latest_event_cursor);
+    if let Some(output) = extract_latest_result(events) {
+        return LatestOutput {
+            session_id: session.session_id.clone(),
+            turn_id: Some(turn.turn_id.clone()),
+            turn_resource_uri: Some(turn.resource_uri.clone()),
+            status: Some(turn.status.clone()),
+            event_cursor,
+            source_event: Some(output.event),
+            result_text: Some(output.text),
+            result_source: output.source,
+            needs_event_inspection: false,
+            inspection_hint: None,
+        };
+    }
+
+    LatestOutput {
+        session_id: session.session_id.clone(),
+        turn_id: Some(turn.turn_id.clone()),
+        turn_resource_uri: Some(turn.resource_uri.clone()),
+        status: Some(turn.status.clone()),
+        event_cursor,
+        source_event: latest_event,
+        result_text: None,
+        result_source: LatestOutputSource::None,
+        needs_event_inspection: true,
+        inspection_hint: Some(format!(
+            "no concise assistant text, terminal summary, or error message found in {} recent turn event(s); inspect raw events with read_events(resource_uri={})",
+            events.len(),
+            turn.resource_uri
+        )),
+    }
+}
+
+struct ExtractedOutput {
+    text: String,
+    source: LatestOutputSource,
+    event: LatestOutputEventRef,
+}
+
+fn extract_latest_result(events: &[Event]) -> Option<ExtractedOutput> {
+    latest_assistant_message(events)
+        .or_else(|| latest_turn_summary(events))
+        .or_else(|| latest_error_message(events))
+}
+
+fn latest_assistant_message(events: &[Event]) -> Option<ExtractedOutput> {
+    events
+        .iter()
+        .rev()
+        .filter(|event| event.event_type == "assistant.message")
+        .find_map(|event| {
+            assistant_message_text(event).map(|text| ExtractedOutput {
+                text,
+                source: LatestOutputSource::AssistantMessage,
+                event: latest_output_event_ref(event),
+            })
+        })
+}
+
+fn latest_turn_summary(events: &[Event]) -> Option<ExtractedOutput> {
+    events
+        .iter()
+        .rev()
+        .filter(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "turn.completed" | "turn.failed" | "turn.cancelled" | "message.completed"
+            )
+        })
+        .find_map(|event| {
+            terminal_summary_text(event).map(|text| ExtractedOutput {
+                text,
+                source: LatestOutputSource::TurnSummary,
+                event: latest_output_event_ref(event),
+            })
+        })
+}
+
+fn latest_error_message(events: &[Event]) -> Option<ExtractedOutput> {
+    events
+        .iter()
+        .rev()
+        .filter(|event| event.event_type == "session.error")
+        .find_map(|event| {
+            error_message_text(event).map(|text| ExtractedOutput {
+                text,
+                source: LatestOutputSource::ErrorMessage,
+                event: latest_output_event_ref(event),
+            })
+        })
+}
+
+fn assistant_message_text(event: &Event) -> Option<String> {
+    string_path(&event.payload, &["data", "content"])
+        .or_else(|| string_path(&event.payload, &["content"]))
+        .map(ToString::to_string)
+}
+
+fn terminal_summary_text(event: &Event) -> Option<String> {
+    string_path(&event.payload, &["summary"])
+        .or_else(|| string_path(&event.payload, &["content"]))
+        .map(ToString::to_string)
+}
+
+fn error_message_text(event: &Event) -> Option<String> {
+    string_path(&event.payload, &["data", "message"])
+        .or_else(|| string_path(&event.payload, &["message"]))
+        .or_else(|| string_path(&event.payload, &["summary"]))
+        .map(ToString::to_string)
+}
+
+fn string_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_str().filter(|text| !text.trim().is_empty())
+}
+
+fn latest_output_event_ref(event: &Event) -> LatestOutputEventRef {
+    LatestOutputEventRef {
+        event_id: event.event_id.clone(),
+        server_seq: event.server_seq,
+        event_type: event.event_type.clone(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CreateSessionRequest {
     pub description: String,
@@ -940,6 +1116,12 @@ pub struct ReadEventsReply {
     pub events: Vec<Event>,
     pub next_cursor: i64,
     pub timed_out: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GetLatestOutputRequest {
+    pub session_id: String,
+    pub turn_id: Option<TurnId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1023,7 +1205,7 @@ pub fn ahp_like_session_snapshot(detail: &SessionDetail) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use singleton_core::{CleanupPolicy, WorkspaceSpec};
+    use singleton_core::{CleanupPolicy, LatestOutputSource, WorkspaceSpec};
     use singleton_host::LocalHostConnector;
     use singleton_test_support::{FakeBackend, FakeTurnBehavior};
     use tempfile::TempDir;
@@ -1081,6 +1263,167 @@ mod tests {
         );
         assert_eq!(events.events.len(), 1);
         assert_eq!(broker.get_inbox()?.counts.completed_turn, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn latest_output_returns_fake_completion_summary() -> Result<()> {
+        let broker = Broker::new(
+            Store::open_memory()?,
+            FakeBackend::with_behaviors([FakeTurnBehavior::Complete {
+                summary: "finished compactly".to_string(),
+            }]),
+            LocalHostConnector,
+        );
+        let created = create_basic_session(&broker, "Latest output success").await?;
+        let sent = broker
+            .send_message(SendMessageRequest {
+                session_id: created.session_id.clone(),
+                message: "finish".to_string(),
+                mode: None,
+            })
+            .await?;
+        broker
+            .read_events(ReadEventsRequest {
+                session_id: Some(created.session_id.clone()),
+                cursor: Some(sent.event_cursor),
+                limit: Some(100),
+                event_types: vec!["turn.completed".to_string()],
+                wait_ms: Some(1_000),
+                resource_uri: None,
+            })
+            .await?;
+
+        let output = broker.get_latest_output(GetLatestOutputRequest {
+            session_id: created.session_id,
+            turn_id: None,
+        })?;
+
+        assert_eq!(output.turn_id.as_deref(), Some(sent.turn_id.as_str()));
+        assert_eq!(output.status, Some(ResourceStatus::Completed));
+        assert_eq!(output.result_text.as_deref(), Some("finished compactly"));
+        assert_eq!(output.result_source, LatestOutputSource::TurnSummary);
+        assert!(!output.needs_event_inspection);
+        assert_eq!(
+            output
+                .source_event
+                .as_ref()
+                .map(|event| event.event_type.as_str()),
+            Some("turn.completed")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn latest_output_returns_fake_failure_summary() -> Result<()> {
+        let broker = Broker::new(
+            Store::open_memory()?,
+            FakeBackend::with_behaviors([FakeTurnBehavior::Fail {
+                summary: "backend failed deterministically".to_string(),
+            }]),
+            LocalHostConnector,
+        );
+        let created = create_basic_session(&broker, "Latest output failure").await?;
+        let sent = broker
+            .send_message(SendMessageRequest {
+                session_id: created.session_id.clone(),
+                message: "fail".to_string(),
+                mode: None,
+            })
+            .await?;
+        broker
+            .read_events(ReadEventsRequest {
+                session_id: Some(created.session_id.clone()),
+                cursor: Some(sent.event_cursor),
+                limit: Some(100),
+                event_types: vec!["turn.failed".to_string()],
+                wait_ms: Some(1_000),
+                resource_uri: None,
+            })
+            .await?;
+
+        let output = broker.get_latest_output(GetLatestOutputRequest {
+            session_id: created.session_id,
+            turn_id: Some(sent.turn_id),
+        })?;
+
+        assert_eq!(output.status, Some(ResourceStatus::Failed));
+        assert_eq!(
+            output.result_text.as_deref(),
+            Some("backend failed deterministically")
+        );
+        assert_eq!(output.result_source, LatestOutputSource::TurnSummary);
+        assert!(!output.needs_event_inspection);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn latest_output_marks_completed_turn_without_text_for_event_inspection() -> Result<()> {
+        let broker = Broker::new(
+            Store::open_memory()?,
+            FakeBackend::with_behaviors([FakeTurnBehavior::CompleteWithoutOutput]),
+            LocalHostConnector,
+        );
+        let created = create_basic_session(&broker, "Latest output no text").await?;
+        let sent = broker
+            .send_message(SendMessageRequest {
+                session_id: created.session_id.clone(),
+                message: "finish quietly".to_string(),
+                mode: None,
+            })
+            .await?;
+        broker
+            .read_events(ReadEventsRequest {
+                session_id: Some(created.session_id.clone()),
+                cursor: Some(sent.event_cursor),
+                limit: Some(100),
+                event_types: vec!["turn.completed".to_string()],
+                wait_ms: Some(1_000),
+                resource_uri: None,
+            })
+            .await?;
+
+        let output = broker.get_latest_output(GetLatestOutputRequest {
+            session_id: created.session_id,
+            turn_id: None,
+        })?;
+
+        assert_eq!(output.status, Some(ResourceStatus::Completed));
+        assert_eq!(output.result_text, None);
+        assert_eq!(output.result_source, LatestOutputSource::None);
+        assert!(output.needs_event_inspection);
+        assert!(output.event_cursor >= sent.event_cursor);
+        assert_eq!(
+            output
+                .source_event
+                .as_ref()
+                .map(|event| event.event_type.as_str()),
+            Some("turn.completed")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn latest_output_returns_no_turn_metadata_for_empty_session() -> Result<()> {
+        let broker = Broker::new(
+            Store::open_memory()?,
+            FakeBackend::new(),
+            LocalHostConnector,
+        );
+        let created = create_basic_session(&broker, "Latest output no turn").await?;
+
+        let output = broker.get_latest_output(GetLatestOutputRequest {
+            session_id: created.session_id.clone(),
+            turn_id: None,
+        })?;
+
+        assert_eq!(output.session_id, created.session_id);
+        assert_eq!(output.turn_id, None);
+        assert_eq!(output.status, None);
+        assert_eq!(output.result_text, None);
+        assert_eq!(output.result_source, LatestOutputSource::None);
+        assert!(!output.needs_event_inspection);
+        assert_eq!(output.event_cursor, created.event_cursor);
         Ok(())
     }
 
@@ -1367,5 +1710,22 @@ mod tests {
         )?;
         assert_eq!(events.len(), 2);
         Ok(())
+    }
+
+    async fn create_basic_session(
+        broker: &Broker<FakeBackend, LocalHostConnector>,
+        description: &str,
+    ) -> Result<CreateSessionReply> {
+        broker
+            .create_session(CreateSessionRequest {
+                description: description.to_string(),
+                title: None,
+                backend: None,
+                workspace: None,
+                model: None,
+                mode: None,
+                labels: Vec::new(),
+            })
+            .await
     }
 }

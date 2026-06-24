@@ -494,6 +494,27 @@ impl Store {
         }
     }
 
+    pub fn latest_terminal_turn_for_session(&self, session_id: &str) -> Result<Option<Turn>> {
+        let conn = self.conn.lock().map_err(|_| lock_err())?;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT turn_id, resource_uri, session_id, backend_turn_id, message, status, unread, created_at, updated_at
+                FROM turns
+                WHERE session_id = ?1 AND status IN ('completed', 'failed', 'cancelled')
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT 1
+                "#,
+            )
+            .map_err(store_err)?;
+        let mut rows = stmt.query(params![session_id]).map_err(store_err)?;
+        if let Some(row) = rows.next().map_err(store_err)? {
+            Ok(Some(turn_row(row).map_err(store_err)?.try_into_turn()?))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn inbox_turns(&self) -> Result<Vec<Turn>> {
         let conn = self.conn.lock().map_err(|_| lock_err())?;
         let mut stmt = conn
@@ -881,6 +902,38 @@ impl Store {
                 events.push(event);
             }
         }
+        Ok(events)
+    }
+
+    pub fn read_recent_events_for_resource(
+        &self,
+        target_resource_uri: &str,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        let limit = i64::try_from(limit.min(500)).map_err(|error| {
+            SingletonError::InvalidInput(format!("invalid event limit conversion: {error}"))
+        })?;
+        let conn = self.conn.lock().map_err(|_| lock_err())?;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT server_seq, event_id, resource_uri, parent_resource_uri, event_type,
+                       origin_kind, origin_id, payload_json, created_at
+                FROM events
+                WHERE resource_uri = ?1 OR parent_resource_uri = ?1
+                ORDER BY server_seq DESC
+                LIMIT ?2
+                "#,
+            )
+            .map_err(store_err)?;
+        let mut rows = stmt
+            .query(params![target_resource_uri, limit])
+            .map_err(store_err)?;
+        let mut events = Vec::new();
+        while let Some(row) = rows.next().map_err(store_err)? {
+            events.push(event_row(row).map_err(store_err)?.try_into_event()?);
+        }
+        events.reverse();
         Ok(events)
     }
 
