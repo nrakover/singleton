@@ -85,8 +85,13 @@ Remaining MCP and daemon usability follow-ups:
 
 ## Remote hosts
 
-- Extend the initial `RemoteRunner`/`SshHostConnector` scaffold into a full
-  remote session runner with reconnect/replay semantics.
+- Feed the explicit `SshHostConfig` control-surface connector from
+  `EffectiveConfig`, including config source/trust metadata so project config
+  cannot override `connect_command`.
+- Extend the SSH control-surface connector into a full remote session runner
+  with reconnect/replay semantics and remote event ingestion.
+- Add a remote workspace allocator so SSH git worktrees do not require explicit
+  `worktree_path_hint`.
 - Evaluate cloud sandbox providers such as GitHub-hosted sessions or Daytona.
 - Support repo-homed workspaces on remote hosts.
 

@@ -7,7 +7,8 @@ use singleton_core::{
     HostKind, RepoMetadata, ResourceKind, ResourceStatus, Result, SingletonError, Workspace,
     WorkspaceSpec, new_id, now_rfc3339, resource_uri,
 };
-use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 #[derive(Debug, Clone, Default)]
 pub struct LocalHostConnector;
@@ -154,9 +155,17 @@ pub struct SshHostConfig {
     pub host_id: HostId,
     pub target: String,
     pub ssh_args: Vec<String>,
-    pub remote_state_dir: String,
-    pub agent_backends: Vec<String>,
-    pub auth_ref: Option<String>,
+    pub connect_command: String,
+    pub trust: SshConfigTrust,
+}
+
+pub const DEFAULT_SSH_CONNECT_COMMAND: &str = "singleton serve --stdio";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SshConfigTrust {
+    #[default]
+    TrustedUser,
+    Project,
 }
 
 impl SshHostConfig {
@@ -165,11 +174,74 @@ impl SshHostConfig {
             host_id: host_id.into(),
             target: target.into(),
             ssh_args: Vec::new(),
-            remote_state_dir: "~/.singleton".to_string(),
-            agent_backends: vec![singleton_core::COPILOT_BACKEND_ID.to_string()],
-            auth_ref: None,
+            connect_command: DEFAULT_SSH_CONNECT_COMMAND.to_string(),
+            trust: SshConfigTrust::TrustedUser,
         }
     }
+
+    pub fn from_project_config(host_id: impl Into<String>, target: impl Into<String>) -> Self {
+        Self {
+            trust: SshConfigTrust::Project,
+            ..Self::new(host_id, target)
+        }
+    }
+
+    pub fn with_connect_command(mut self, connect_command: impl Into<String>) -> Self {
+        self.connect_command = connect_command.into();
+        self
+    }
+
+    pub fn with_ssh_args<I, S>(mut self, ssh_args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.ssh_args = ssh_args.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_trust(mut self, trust: SshConfigTrust) -> Self {
+        self.trust = trust;
+        self
+    }
+
+    pub fn control_invocation(&self) -> Result<SshInvocation> {
+        self.validate()?;
+        let mut args = self.ssh_args.clone();
+        args.push(self.target.clone());
+        args.push(self.connect_command.clone());
+        Ok(SshInvocation {
+            program: "ssh".to_string(),
+            args,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_ssh_target(&self.target)?;
+        validate_ssh_args(&self.ssh_args)?;
+        validate_remote_command(&self.connect_command, "connect_command")?;
+        if self.trust == SshConfigTrust::Project
+            && self.connect_command != DEFAULT_SSH_CONNECT_COMMAND
+        {
+            return Err(SingletonError::InvalidInput(
+                "project ssh host config cannot override connect_command; use trusted user config for non-default remote commands"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshInvocation {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteProcessExit {
+    pub success: bool,
+    pub code: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,6 +271,9 @@ impl RemoteRunner for SshRemoteRunner {
         ssh_args: &[String],
         command: &str,
     ) -> Result<RemoteCommandOutput> {
+        validate_ssh_target(target)?;
+        validate_ssh_args(ssh_args)?;
+        validate_remote_command(command, "remote command")?;
         let output = Command::new("ssh")
             .args(ssh_args)
             .arg(target)
@@ -225,28 +300,183 @@ impl RemoteRunner for SshRemoteRunner {
     }
 }
 
+#[async_trait]
+pub trait RemoteProcessTransport: Send + Sync {
+    type Process: RemoteStdioProcess;
+
+    async fn spawn(&self, invocation: SshInvocation) -> Result<Self::Process>;
+}
+
+#[async_trait]
+pub trait RemoteStdioProcess: Send {
+    async fn write_stdin(&mut self, bytes: &[u8]) -> Result<()>;
+
+    async fn read_stdout_line(&mut self) -> Result<Option<Vec<u8>>>;
+
+    async fn close_stdin(&mut self) -> Result<()>;
+
+    async fn wait(&mut self) -> Result<RemoteProcessExit>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SshProcessTransport;
+
+#[async_trait]
+impl RemoteProcessTransport for SshProcessTransport {
+    type Process = SshChildProcess;
+
+    async fn spawn(&self, invocation: SshInvocation) -> Result<Self::Process> {
+        let mut child = Command::new(&invocation.program)
+            .args(&invocation.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|error| SingletonError::Host {
+                host: ssh_invocation_target(&invocation)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                message: format!("spawn ssh control surface: {error}"),
+            })?;
+        let stdin = child.stdin.take().ok_or_else(|| SingletonError::Host {
+            host: ssh_invocation_target(&invocation)
+                .unwrap_or("unknown")
+                .to_string(),
+            message: "ssh control surface stdin was not piped".to_string(),
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| SingletonError::Host {
+            host: ssh_invocation_target(&invocation)
+                .unwrap_or("unknown")
+                .to_string(),
+            message: "ssh control surface stdout was not piped".to_string(),
+        })?;
+        Ok(SshChildProcess {
+            child,
+            stdin: Some(stdin),
+            stdout: BufReader::new(stdout),
+        })
+    }
+}
+
+pub struct SshChildProcess {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+}
+
+#[async_trait]
+impl RemoteStdioProcess for SshChildProcess {
+    async fn write_stdin(&mut self, bytes: &[u8]) -> Result<()> {
+        let Some(stdin) = &mut self.stdin else {
+            return Err(SingletonError::Host {
+                host: "ssh".to_string(),
+                message: "ssh control surface stdin is closed".to_string(),
+            });
+        };
+        stdin
+            .write_all(bytes)
+            .await
+            .map_err(|error| SingletonError::Host {
+                host: "ssh".to_string(),
+                message: format!("write ssh control surface stdin: {error}"),
+            })
+    }
+
+    async fn read_stdout_line(&mut self) -> Result<Option<Vec<u8>>> {
+        let mut line = Vec::new();
+        let read = self
+            .stdout
+            .read_until(b'\n', &mut line)
+            .await
+            .map_err(|error| SingletonError::Host {
+                host: "ssh".to_string(),
+                message: format!("read ssh control surface stdout: {error}"),
+            })?;
+        if read == 0 { Ok(None) } else { Ok(Some(line)) }
+    }
+
+    async fn close_stdin(&mut self) -> Result<()> {
+        let Some(mut stdin) = self.stdin.take() else {
+            return Ok(());
+        };
+        stdin
+            .shutdown()
+            .await
+            .map_err(|error| SingletonError::Host {
+                host: "ssh".to_string(),
+                message: format!("close ssh control surface stdin: {error}"),
+            })
+    }
+
+    async fn wait(&mut self) -> Result<RemoteProcessExit> {
+        let status = self
+            .child
+            .wait()
+            .await
+            .map_err(|error| SingletonError::Host {
+                host: "ssh".to_string(),
+                message: format!("wait for ssh control surface: {error}"),
+            })?;
+        Ok(RemoteProcessExit {
+            success: status.success(),
+            code: status.code(),
+        })
+    }
+}
+
 #[derive(Clone)]
-pub struct SshHostConnector<R>
+pub struct SshHostConnector<R, T = SshProcessTransport>
 where
     R: RemoteRunner,
+    T: RemoteProcessTransport,
 {
     config: SshHostConfig,
     runner: R,
+    control_transport: T,
 }
 
-impl<R> SshHostConnector<R>
+impl<R> SshHostConnector<R, SshProcessTransport>
 where
     R: RemoteRunner,
 {
     pub fn new(config: SshHostConfig, runner: R) -> Self {
-        Self { config, runner }
+        Self {
+            config,
+            runner,
+            control_transport: SshProcessTransport,
+        }
+    }
+}
+
+impl<R, T> SshHostConnector<R, T>
+where
+    R: RemoteRunner,
+    T: RemoteProcessTransport,
+{
+    pub fn with_control_transport(config: SshHostConfig, runner: R, control_transport: T) -> Self {
+        Self {
+            config,
+            runner,
+            control_transport,
+        }
+    }
+
+    pub fn config(&self) -> &SshHostConfig {
+        &self.config
+    }
+
+    pub async fn connect_control_surface(&self) -> Result<T::Process> {
+        self.control_transport
+            .spawn(self.config.control_invocation()?)
+            .await
     }
 }
 
 #[async_trait]
-impl<R> HostConnector for SshHostConnector<R>
+impl<R, T> HostConnector for SshHostConnector<R, T>
 where
     R: RemoteRunner,
+    T: RemoteProcessTransport,
 {
     fn host(&self) -> Host {
         Host {
@@ -260,7 +490,7 @@ where
                     "git_worktree".to_string(),
                     "backend_default".to_string(),
                 ],
-                agent_backends: self.config.agent_backends.clone(),
+                agent_backends: vec![singleton_core::COPILOT_BACKEND_ID.to_string()],
                 supports_reconnect: true,
                 supports_ordered_events: true,
             },
@@ -268,6 +498,7 @@ where
     }
 
     async fn ensure_workspace(&self, spec: WorkspaceSpec) -> Result<Workspace> {
+        self.config.validate()?;
         match spec {
             WorkspaceSpec::ExistingWorkspace { workspace_id } => Err(SingletonError::InvalidInput(
                 format!("existing workspace {workspace_id} must be resolved by the broker store"),
@@ -302,13 +533,12 @@ where
             } => {
                 let base_ref = base_ref.unwrap_or_else(|| "HEAD".to_string());
                 let branch = branch.unwrap_or_else(|| new_id("branch").replace('_', "-"));
-                let worktree_path = worktree_path_hint.unwrap_or_else(|| {
-                    format!(
-                        "{}/worktrees/{}",
-                        self.config.remote_state_dir.trim_end_matches('/'),
-                        branch
+                let worktree_path = worktree_path_hint.ok_or_else(|| {
+                    SingletonError::InvalidInput(
+                        "ssh git_worktree requires worktree_path_hint; ssh host config does not carry remote state directories"
+                            .to_string(),
                     )
-                });
+                })?;
                 let command = remote_worktree_add_command(
                     &repo,
                     &worktree_path,
@@ -346,6 +576,7 @@ where
         disposition: CloseDisposition,
         force: bool,
     ) -> Result<CleanupSummary> {
+        self.config.validate()?;
         if disposition != CloseDisposition::Delete {
             return Ok(CleanupSummary {
                 deleted_paths: Vec::new(),
@@ -436,6 +667,57 @@ pub fn remote_worktree_remove_command(repo: &str, worktree: &str, force: bool) -
 
 pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn validate_ssh_target(target: &str) -> Result<()> {
+    if target.trim().is_empty() {
+        return Err(SingletonError::InvalidInput(
+            "ssh target must not be empty".to_string(),
+        ));
+    }
+    if target != target.trim() {
+        return Err(SingletonError::InvalidInput(
+            "ssh target must not contain leading or trailing whitespace".to_string(),
+        ));
+    }
+    if target.starts_with('-') {
+        return Err(SingletonError::InvalidInput(
+            "ssh target must not start with '-'".to_string(),
+        ));
+    }
+    validate_no_control_chars(target, "ssh target")
+}
+
+fn validate_ssh_args(ssh_args: &[String]) -> Result<()> {
+    for arg in ssh_args {
+        validate_no_control_chars(arg, "ssh_args")?;
+    }
+    Ok(())
+}
+
+fn validate_remote_command(command: &str, label: &str) -> Result<()> {
+    if command.trim().is_empty() {
+        return Err(SingletonError::InvalidInput(format!(
+            "{label} must not be empty"
+        )));
+    }
+    validate_no_control_chars(command, label)
+}
+
+fn validate_no_control_chars(value: &str, label: &str) -> Result<()> {
+    if value
+        .bytes()
+        .any(|byte| byte == 0 || byte == b'\n' || byte == b'\r')
+    {
+        return Err(SingletonError::InvalidInput(format!(
+            "{label} must not contain NUL or newline characters"
+        )));
+    }
+    Ok(())
+}
+
+fn ssh_invocation_target(invocation: &SshInvocation) -> Option<&str> {
+    invocation.args.iter().rev().nth(1).map(String::as_str)
 }
 
 fn new_workspace(
@@ -545,8 +827,9 @@ async fn run_git(mut command: Command, action: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::fs;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, MutexGuard};
 
     use tempfile::TempDir;
 
@@ -630,24 +913,29 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct RecordingRunner {
-        commands: Arc<Mutex<Vec<String>>>,
+        commands: Arc<Mutex<Vec<RecordedRemoteCommand>>>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedRemoteCommand {
+        target: String,
+        ssh_args: Vec<String>,
+        command: String,
     }
 
     #[async_trait]
     impl RemoteRunner for RecordingRunner {
         async fn run(
             &self,
-            _target: &str,
-            _ssh_args: &[String],
+            target: &str,
+            ssh_args: &[String],
             command: &str,
         ) -> Result<RemoteCommandOutput> {
-            self.commands
-                .lock()
-                .map_err(|_| SingletonError::Host {
-                    host: "ssh_test".to_string(),
-                    message: "recording runner lock poisoned".to_string(),
-                })?
-                .push(command.to_string());
+            test_lock(&self.commands)?.push(RecordedRemoteCommand {
+                target: target.to_string(),
+                ssh_args: ssh_args.to_vec(),
+                command: command.to_string(),
+            });
             Ok(RemoteCommandOutput {
                 stdout: String::new(),
                 stderr: String::new(),
@@ -674,25 +962,281 @@ mod tests {
         connector
             .close_workspace(&workspace, CloseDisposition::Delete, true)
             .await?;
-        let commands = commands.lock().map_err(|_| SingletonError::Host {
-            host: "ssh_test".to_string(),
-            message: "recording runner lock poisoned".to_string(),
-        })?;
+        let commands = test_lock(&commands)?;
 
         assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].target, "devbox");
+        assert!(commands[0].ssh_args.is_empty());
         assert_eq!(
-            commands[0],
+            commands[0].command,
             "mkdir -p $(dirname '/srv/worktrees/feature-x') && git -C '/srv/repo' worktree add -b 'feature-x' '/srv/worktrees/feature-x' 'main'"
         );
         assert_eq!(
-            commands[1],
+            commands[1].command,
             "git -C '/srv/repo' worktree remove --force '/srv/worktrees/feature-x'"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ssh_git_worktree_requires_explicit_worktree_path_hint() -> Result<()> {
+        let runner = RecordingRunner::default();
+        let commands = runner.commands.clone();
+        let connector = SshHostConnector::new(SshHostConfig::new("host_ssh", "devbox"), runner);
+
+        let result = connector
+            .ensure_workspace(WorkspaceSpec::GitWorktree {
+                repo: "/srv/repo".to_string(),
+                base_ref: Some("main".to_string()),
+                branch: Some("feature-x".to_string()),
+                create_branch: Some(true),
+                worktree_path_hint: None,
+                host_id: None,
+                cleanup_policy: Some(CleanupPolicy::Keep),
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(SingletonError::InvalidInput(message))
+                if message.contains("requires worktree_path_hint")
+        ));
+        assert!(test_lock(&commands)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn ssh_control_invocation_uses_default_connect_command() -> Result<()> {
+        let invocation = SshHostConfig::new("host_ssh", "devbox").control_invocation()?;
+
+        assert_eq!(invocation.program, "ssh");
+        assert_eq!(
+            invocation.args,
+            vec![
+                "devbox".to_string(),
+                DEFAULT_SSH_CONNECT_COMMAND.to_string()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ssh_control_invocation_preserves_optional_ssh_args() -> Result<()> {
+        let invocation = SshHostConfig::new("host_ssh", "devbox")
+            .with_ssh_args(["-p", "2222", "-o", "BatchMode=yes"])
+            .control_invocation()?;
+
+        assert_eq!(
+            invocation.args,
+            vec![
+                "-p".to_string(),
+                "2222".to_string(),
+                "-o".to_string(),
+                "BatchMode=yes".to_string(),
+                "devbox".to_string(),
+                DEFAULT_SSH_CONNECT_COMMAND.to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ssh_control_invocation_keeps_connect_command_as_single_argument() -> Result<()> {
+        let command = "singleton serve --stdio --backend fake; echo trusted user command";
+        let invocation = SshHostConfig::new("host_ssh", "devbox")
+            .with_connect_command(command)
+            .control_invocation()?;
+
+        assert_eq!(
+            invocation.args,
+            vec!["devbox".to_string(), command.to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ssh_control_invocation_rejects_unsafe_target() {
+        let result = SshHostConfig::new("host_ssh", "-oProxyCommand=sh").control_invocation();
+
+        assert!(matches!(
+            result,
+            Err(SingletonError::InvalidInput(message))
+                if message.contains("must not start with '-'")
+        ));
+    }
+
+    #[test]
+    fn ssh_control_invocation_rejects_newlines_in_ssh_args() {
+        let result = SshHostConfig::new("host_ssh", "devbox")
+            .with_ssh_args(["-o", "BatchMode=yes\nProxyCommand=sh"])
+            .control_invocation();
+
+        assert!(matches!(
+            result,
+            Err(SingletonError::InvalidInput(message))
+                if message.contains("ssh_args must not contain")
+        ));
+    }
+
+    #[test]
+    fn project_config_cannot_override_connect_command() {
+        let result = SshHostConfig::from_project_config("host_ssh", "devbox")
+            .with_connect_command("singleton serve --stdio --backend fake")
+            .control_invocation();
+
+        assert!(matches!(
+            result,
+            Err(SingletonError::InvalidInput(message))
+                if message.contains("project ssh host config cannot override connect_command")
+        ));
+    }
+
+    #[test]
+    fn project_config_can_use_default_connect_command() -> Result<()> {
+        let invocation =
+            SshHostConfig::from_project_config("host_ssh", "devbox").control_invocation()?;
+
+        assert_eq!(
+            invocation.args,
+            vec![
+                "devbox".to_string(),
+                DEFAULT_SSH_CONNECT_COMMAND.to_string()
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ssh_control_surface_uses_injected_stdio_transport_for_fake_mcp() -> Result<()> {
+        let response = br#"{"jsonrpc":"2.0","id":1,"result":{"session_id":"sess_fake"}}"#.to_vec();
+        let transport = ScriptedTransport::with_responses([add_newline(response)]);
+        let invocations = transport.invocations.clone();
+        let writes = transport.writes.clone();
+        let connector = SshHostConnector::with_control_transport(
+            SshHostConfig::new("host_ssh", "devbox").with_ssh_args(["-o", "BatchMode=yes"]),
+            RecordingRunner::default(),
+            transport,
+        );
+
+        let mut process = connector.connect_control_surface().await?;
+        let request =
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_session"}}"#;
+        process.write_stdin(&add_newline(request.to_vec())).await?;
+        let output = process
+            .read_stdout_line()
+            .await?
+            .ok_or_else(|| SingletonError::Host {
+                host: "ssh_test".to_string(),
+                message: "fake mcp process returned no output".to_string(),
+            })?;
+        process.close_stdin().await?;
+        let exit = process.wait().await?;
+
+        assert!(exit.success);
+        assert_eq!(
+            String::from_utf8_lossy(&output),
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"session_id\":\"sess_fake\"}}\n"
+        );
+        let invocations = test_lock(&invocations)?;
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(
+            invocations[0].args,
+            vec![
+                "-o".to_string(),
+                "BatchMode=yes".to_string(),
+                "devbox".to_string(),
+                DEFAULT_SSH_CONNECT_COMMAND.to_string(),
+            ]
+        );
+        let writes = test_lock(&writes)?;
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0], add_newline(request.to_vec()));
         Ok(())
     }
 
     #[test]
     fn shell_quote_handles_single_quotes() {
         assert_eq!(shell_quote("a'b"), "'a'\"'\"'b'");
+    }
+
+    #[derive(Clone, Default)]
+    struct ScriptedTransport {
+        invocations: Arc<Mutex<Vec<SshInvocation>>>,
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        responses: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    }
+
+    impl ScriptedTransport {
+        fn with_responses<I>(responses: I) -> Self
+        where
+            I: IntoIterator<Item = Vec<u8>>,
+        {
+            Self {
+                responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+                ..Self::default()
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RemoteProcessTransport for ScriptedTransport {
+        type Process = ScriptedProcess;
+
+        async fn spawn(&self, invocation: SshInvocation) -> Result<Self::Process> {
+            test_lock(&self.invocations)?.push(invocation);
+            Ok(ScriptedProcess {
+                writes: self.writes.clone(),
+                responses: self.responses.clone(),
+                closed: false,
+            })
+        }
+    }
+
+    struct ScriptedProcess {
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        responses: Arc<Mutex<VecDeque<Vec<u8>>>>,
+        closed: bool,
+    }
+
+    #[async_trait]
+    impl RemoteStdioProcess for ScriptedProcess {
+        async fn write_stdin(&mut self, bytes: &[u8]) -> Result<()> {
+            if self.closed {
+                return Err(SingletonError::Host {
+                    host: "ssh_test".to_string(),
+                    message: "scripted process stdin closed".to_string(),
+                });
+            }
+            test_lock(&self.writes)?.push(bytes.to_vec());
+            Ok(())
+        }
+
+        async fn read_stdout_line(&mut self) -> Result<Option<Vec<u8>>> {
+            Ok(test_lock(&self.responses)?.pop_front())
+        }
+
+        async fn close_stdin(&mut self) -> Result<()> {
+            self.closed = true;
+            Ok(())
+        }
+
+        async fn wait(&mut self) -> Result<RemoteProcessExit> {
+            Ok(RemoteProcessExit {
+                success: true,
+                code: Some(0),
+            })
+        }
+    }
+
+    fn add_newline(mut bytes: Vec<u8>) -> Vec<u8> {
+        bytes.push(b'\n');
+        bytes
+    }
+
+    fn test_lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
+        mutex.lock().map_err(|_| SingletonError::Host {
+            host: "ssh_test".to_string(),
+            message: "test lock poisoned".to_string(),
+        })
     }
 }

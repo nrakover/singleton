@@ -211,7 +211,59 @@ cargo test --workspace --features live-copilot -- --ignored
   - **Invariants**: Remote workspace lifecycle commands are deterministic and
     quote all paths/refs before execution.
 
-- **H4. Shell quoting preserves single quotes**
+- **H4. SSH control invocation is argv-safe and defaults to stdio**
+  - **Status**: Enforced.
+  - **Executable anchors**:
+    `ssh_control_invocation_uses_default_connect_command`,
+    `ssh_control_invocation_preserves_optional_ssh_args`,
+    `ssh_control_invocation_keeps_connect_command_as_single_argument`.
+  - **Preconditions**: Build SSH host configs with default connect command,
+    optional `ssh_args`, and a trusted non-default `connect_command`.
+  - **Postconditions**: The connector builds `ssh [ssh_args...] target
+    connect_command`; the default command is `singleton serve --stdio`; optional
+    SSH args and the connect command remain distinct argv items.
+  - **Invariants**: No local shell parses the SSH target, SSH args, or connect
+    command; non-default connect commands are explicit trusted-user input.
+
+- **H5. SSH config rejects unsafe project or argument input**
+  - **Status**: Enforced.
+  - **Executable anchors**:
+    `ssh_control_invocation_rejects_unsafe_target`,
+    `ssh_control_invocation_rejects_newlines_in_ssh_args`,
+    `project_config_cannot_override_connect_command`,
+    `project_config_can_use_default_connect_command`.
+  - **Preconditions**: Build SSH host configs with an option-looking target,
+    newline-bearing `ssh_args`, a project-sourced non-default connect command,
+    and a project-sourced default connect command.
+  - **Postconditions**: Unsafe target and newline-bearing args fail explicitly;
+    project config cannot override `connect_command`; project config can use the
+    default `singleton serve --stdio`.
+  - **Invariants**: Project config cannot silently introduce arbitrary remote
+    commands, and SSH argv fields reject control-character injection.
+
+- **H6. SSH stdio transport is fakeable without an SSH server**
+  - **Status**: Enforced.
+  - **Executable anchors**:
+    `ssh_control_surface_uses_injected_stdio_transport_for_fake_mcp`.
+  - **Preconditions**: Use an SSH connector with an injected scripted process
+    transport that returns one JSON-RPC line.
+  - **Postconditions**: The connector records the expected SSH invocation, writes
+    the request to fake stdin, reads the scripted response from fake stdout, and
+    observes a successful fake process exit.
+  - **Invariants**: Remote MCP/session behavior at the SSH process boundary is
+    testable without real SSH credentials, networking, or a remote daemon.
+
+- **H7. SSH worktrees require explicit remote paths until allocation exists**
+  - **Status**: Enforced.
+  - **Executable anchors**:
+    `ssh_git_worktree_requires_explicit_worktree_path_hint`.
+  - **Preconditions**: Request an SSH git worktree without `worktree_path_hint`.
+  - **Postconditions**: The request fails explicitly and no remote command is
+    dispatched.
+  - **Invariants**: Local SSH config does not smuggle remote state directories or
+    invent remote worktree roots.
+
+- **H8. Shell quoting preserves single quotes**
   - **Status**: Enforced.
   - **Executable anchors**: `shell_quote_handles_single_quotes`.
   - **Preconditions**: Quote the string `a'b`.
@@ -219,7 +271,7 @@ cargo test --workspace --features live-copilot -- --ignored
   - **Invariants**: Shell quoting must produce a single shell token that
     preserves embedded single quotes.
 
-- **H5. Planned host/workspace invariants**
+- **H9. Planned host/workspace invariants**
   - **Status**: Planned.
   - **Executable anchors**: none for the exact cases below.
   - **Preconditions**: Exercise branch/base-ref metadata, `keep`,
