@@ -118,6 +118,17 @@ local daemon, then proxies MCP newline JSON between stdio and the daemon's Unix
 socket so disconnecting the MCP client does not kill broker-owned background
 turns. `serve --stdio --direct` keeps the broker in the foreground for debugging.
 
+Daemon lifecycle commands are intentionally idempotent: `start` and
+`serve --stdio` reuse an already-listening daemon, while `serve --daemon` is the
+internal daemon entrypoint and fails if another daemon owns the socket. The
+auto-start path uses a per-database `.lock` file around socket cleanup, bind,
+and pid writes, and spawns the daemon into its own Unix process group through
+Rust's safe `CommandExt::process_group(0)` API. `status` reports `running`,
+`stopped`, `stale pid`, `stale socket`, `stale pid and socket`, or `degraded`
+states and prints `singleton stop --database ...` when stale files can be
+cleaned. `stop` remains safe to repeat and removes stale pid/socket files when
+no live daemon owns them.
+
 ## Planned verification
 
 Rust implementation work should pass:

@@ -1,11 +1,13 @@
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, tempdir};
 
 #[test]
 fn cli_start_status_stop_fake_daemon() -> TestResult<()> {
@@ -13,11 +15,77 @@ fn cli_start_status_stop_fake_daemon() -> TestResult<()> {
     let database = db.path().to_string_lossy().to_string();
 
     run_singleton(["start", "--backend", "fake", "--database", &database])?;
+    let _guard = DaemonGuard::new(database.clone());
+    run_singleton(["start", "--backend", "fake", "--database", &database])?;
     let status = run_singleton(["status", "--database", &database])?;
     assert!(status.contains("daemon: running"), "{status}");
+    assert!(status.contains("pid:"), "{status}");
+    assert!(status.contains("(listening)"), "{status}");
+    let pid = read_pid(&pid_path(db.path()))?;
+    let pgid = process_group_id(pid)?;
+    assert_eq!(pgid, pid, "daemon pid {pid} should own its process group");
+    run_singleton(["stop", "--database", &database])?;
     run_singleton(["stop", "--database", &database])?;
     let status = run_singleton(["status", "--database", &database])?;
     assert!(status.contains("daemon: stopped"), "{status}");
+    Ok(())
+}
+
+#[test]
+fn cli_status_reports_and_stop_cleans_stale_lifecycle_files() -> TestResult<()> {
+    let dir = tempdir()?;
+    let database_path = dir.path().join("state.db");
+    let database = database_path.to_string_lossy().to_string();
+    let pid = pid_path(&database_path);
+    let socket = socket_path(&database_path);
+
+    fs::write(&pid, "999999999")?;
+    let status = run_singleton(["status", "--database", &database])?;
+    assert!(status.contains("daemon: stale pid"), "{status}");
+    assert!(
+        status.contains("cleanup: singleton stop --database"),
+        "{status}"
+    );
+    run_singleton(["stop", "--database", &database])?;
+    assert!(!pid.exists(), "stale pid file should be removed");
+
+    fs::write(&socket, "not a socket")?;
+    let status = run_singleton(["status", "--database", &database])?;
+    assert!(status.contains("daemon: stale socket"), "{status}");
+    assert!(
+        status.contains("cleanup: singleton stop --database"),
+        "{status}"
+    );
+    run_singleton(["stop", "--database", &database])?;
+    assert!(!socket.exists(), "stale socket file should be removed");
+
+    let status = run_singleton(["status", "--database", &database])?;
+    assert!(status.contains("daemon: stopped"), "{status}");
+    Ok(())
+}
+
+#[test]
+fn cli_concurrent_fake_daemon_starts_are_idempotent() -> TestResult<()> {
+    let db = NamedTempFile::new()?;
+    let database = db.path().to_string_lossy().to_string();
+    let handles = (0..6)
+        .map(|_| {
+            let database = database.clone();
+            thread::spawn(move || {
+                run_singleton_thread(["start", "--backend", "fake", "--database", &database])
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        let result = handle.join().map_err(|_| err("start thread panicked"))?;
+        result.map_err(err)?;
+    }
+
+    let _guard = DaemonGuard::new(database.clone());
+    let status = run_singleton(["status", "--database", &database])?;
+    assert!(status.contains("daemon: running"), "{status}");
+    run_singleton(["stop", "--database", &database])?;
     Ok(())
 }
 
@@ -131,6 +199,27 @@ fn live_stdio_mcp_serves_copilot_backend() -> TestResult<()> {
 }
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+struct DaemonGuard {
+    database: String,
+}
+
+impl DaemonGuard {
+    fn new(database: String) -> Self {
+        Self { database }
+    }
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        let _ = Command::new(env!("CARGO_BIN_EXE_singleton"))
+            .args(["stop", "--database", &self.database])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
 
 struct StdioMcpClient {
     child: Child,
@@ -308,6 +397,10 @@ fn err(message: impl Into<String>) -> Box<dyn std::error::Error> {
 }
 
 fn run_singleton<const N: usize>(args: [&str; N]) -> TestResult<String> {
+    run_singleton_slice(&args)
+}
+
+fn run_singleton_slice(args: &[&str]) -> TestResult<String> {
     let output = Command::new(env!("CARGO_BIN_EXE_singleton"))
         .args(args)
         .stdin(Stdio::null())
@@ -321,4 +414,57 @@ fn run_singleton<const N: usize>(args: [&str; N]) -> TestResult<String> {
         )));
     }
     Ok(String::from_utf8(output.stdout)?)
+}
+
+fn run_singleton_thread<const N: usize>(args: [&str; N]) -> Result<String, String> {
+    let output = Command::new(env!("CARGO_BIN_EXE_singleton"))
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "singleton command failed with {}: stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|error| error.to_string())
+}
+
+fn pid_path(database: &Path) -> PathBuf {
+    state_path(database, "pid")
+}
+
+fn socket_path(database: &Path) -> PathBuf {
+    state_path(database, "sock")
+}
+
+fn state_path(database: &Path, extension: &str) -> PathBuf {
+    let directory = database.parent().unwrap_or_else(|| Path::new("."));
+    let stem = database
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("singleton");
+    directory.join(format!("{stem}.{extension}"))
+}
+
+fn read_pid(path: &Path) -> TestResult<u32> {
+    Ok(fs::read_to_string(path)?.trim().parse()?)
+}
+
+fn process_group_id(pid: u32) -> TestResult<u32> {
+    let output = Command::new("ps")
+        .args(["-o", "pgid=", "-p", &pid.to_string()])
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(err(format!(
+            "ps failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().parse()?)
 }

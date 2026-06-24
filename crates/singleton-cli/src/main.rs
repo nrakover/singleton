@@ -1,11 +1,13 @@
 use std::collections::hash_map::DefaultHasher;
-use std::fs;
+use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
+use fs2::FileExt;
 use rmcp::ServiceExt;
 use serde_json::json;
 use singleton_broker::Broker;
@@ -17,6 +19,8 @@ use singleton_store::Store;
 use singleton_test_support::FakeBackend;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
+
+const DAEMON_STARTUP_LOCK_HELD_ENV: &str = "SINGLETON_DAEMON_STARTUP_LOCK_HELD";
 
 #[derive(Debug, Parser)]
 #[command(name = "singleton")]
@@ -115,6 +119,135 @@ struct StatePaths {
     database: PathBuf,
     socket: PathBuf,
     pid: PathBuf,
+    lock: PathBuf,
+}
+
+struct DaemonStartupLock {
+    file: File,
+}
+
+impl DaemonStartupLock {
+    fn acquire(paths: &StatePaths) -> Result<Self> {
+        if let Some(parent) = paths.lock.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                SingletonError::Store(format!(
+                    "create daemon lock directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&paths.lock)
+            .map_err(|error| {
+                SingletonError::Store(format!(
+                    "open daemon lock {}: {error}",
+                    paths.lock.display()
+                ))
+            })?;
+        file.lock_exclusive().map_err(|error| {
+            SingletonError::Store(format!(
+                "lock daemon lock {}: {error}",
+                paths.lock.display()
+            ))
+        })?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for DaemonStartupLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonState {
+    Running,
+    Stopped,
+    StalePid,
+    StaleSocket,
+    StalePidAndSocket,
+    Degraded,
+}
+
+impl DaemonState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Stopped => "stopped",
+            Self::StalePid => "stale pid",
+            Self::StaleSocket => "stale socket",
+            Self::StalePidAndSocket => "stale pid and socket",
+            Self::Degraded => "degraded",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PidFileState {
+    Missing,
+    Alive(u32),
+    Dead(u32),
+    Invalid(String),
+}
+
+impl PidFileState {
+    fn describe(&self) -> String {
+        match self {
+            Self::Missing => "missing".to_string(),
+            Self::Alive(pid) => format!("alive pid={pid}"),
+            Self::Dead(pid) => format!("stale pid={pid}"),
+            Self::Invalid(value) => format!("invalid pid={value}"),
+        }
+    }
+
+    fn alive_pid(&self) -> Option<u32> {
+        match self {
+            Self::Alive(pid) => Some(*pid),
+            Self::Missing | Self::Dead(_) | Self::Invalid(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketFileState {
+    Missing,
+    Listening,
+    Stale,
+}
+
+impl SocketFileState {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Listening => "listening",
+            Self::Stale => "stale",
+        }
+    }
+
+    fn is_listening(self) -> bool {
+        matches!(self, Self::Listening)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DaemonStatus {
+    state: DaemonState,
+    pid: PidFileState,
+    socket: SocketFileState,
+}
+
+impl DaemonStatus {
+    fn cleanup_recommended(&self) -> bool {
+        matches!(
+            self.state,
+            DaemonState::StalePid | DaemonState::StaleSocket | DaemonState::StalePidAndSocket
+        ) || (self.state == DaemonState::Degraded && !self.socket.is_listening())
+    }
 }
 
 enum ServeMode {
@@ -183,24 +316,38 @@ async fn serve(
 async fn start(database: Option<PathBuf>, backend: BackendKind) -> Result<()> {
     let paths = resolve_state_paths(database)?;
     ensure_daemon_running(&paths, backend).await?;
+    let daemon = inspect_daemon(&paths).await?;
+    let pid = match daemon.pid {
+        PidFileState::Alive(pid) => pid.to_string(),
+        PidFileState::Missing | PidFileState::Dead(_) | PidFileState::Invalid(_) => {
+            "unknown".to_string()
+        }
+    };
     println!(
         "singletond running: pid={}, socket={}",
-        fs::read_to_string(&paths.pid).unwrap_or_default().trim(),
-        paths.socket.display()
+        pid,
+        paths.socket.display(),
     );
     Ok(())
 }
 
 async fn status(database: Option<PathBuf>) -> Result<()> {
     let paths = resolve_state_paths(database)?;
-    let daemon = if daemon_socket_ready(&paths).await {
-        "running"
-    } else {
-        "stopped"
-    };
-    println!("daemon: {daemon}");
+    let daemon = inspect_daemon(&paths).await?;
+    println!("daemon: {}", daemon.state.label());
     println!("database: {}", paths.database.display());
-    println!("socket: {}", paths.socket.display());
+    println!("pid: {} ({})", paths.pid.display(), daemon.pid.describe());
+    println!(
+        "socket: {} ({})",
+        paths.socket.display(),
+        daemon.socket.describe()
+    );
+    println!("startup_lock: {}", paths.lock.display());
+    if daemon.cleanup_recommended() {
+        println!("cleanup: {}", cleanup_command(&paths.database));
+    } else if daemon.state == DaemonState::Degraded {
+        println!("warning: daemon socket is accepting connections but pid state is degraded");
+    }
     let store = Store::open(paths.database)?;
     let sessions = store.list_sessions()?;
     println!("sessions: {}", sessions.len());
@@ -215,17 +362,8 @@ async fn status(database: Option<PathBuf>) -> Result<()> {
 
 async fn stop(database: Option<PathBuf>) -> Result<()> {
     let paths = resolve_state_paths(database)?;
-    if !paths.pid.exists() {
-        remove_stale_socket(&paths)?;
-        println!("singletond stopped");
-        return Ok(());
-    }
-    let pid_text = fs::read_to_string(&paths.pid)
-        .map_err(|error| SingletonError::Store(format!("read {}: {error}", paths.pid.display())))?;
-    let pid = pid_text.trim().parse::<u32>().map_err(|error| {
-        SingletonError::InvalidState(format!("invalid daemon pid '{}': {error}", pid_text.trim()))
-    })?;
-    if process_alive(pid)? {
+    let daemon = inspect_daemon(&paths).await?;
+    if let Some(pid) = daemon.pid.alive_pid() {
         signal_process(pid, "TERM")?;
         let deadline = Instant::now() + Duration::from_secs(5);
         while process_alive(pid)? && Instant::now() < deadline {
@@ -236,6 +374,12 @@ async fn stop(database: Option<PathBuf>) -> Result<()> {
                 "daemon pid {pid} did not stop after SIGTERM"
             )));
         }
+    } else if daemon.socket.is_listening() {
+        return Err(SingletonError::InvalidState(format!(
+            "daemon socket {} is accepting connections, but pid file {} is not usable; refusing to remove a live socket without a live pid",
+            paths.socket.display(),
+            paths.pid.display()
+        )));
     }
     cleanup_daemon_files(&paths)?;
     println!("singletond stopped");
@@ -454,13 +598,33 @@ async fn run_daemon_server<B>(
 where
     B: AgentBackend + 'static,
 {
-    if daemon_socket_ready(&paths).await {
+    let listener = if daemon_startup_lock_is_held(&paths) {
+        bind_daemon_listener(&paths).await?
+    } else {
+        let _lock = DaemonStartupLock::acquire(&paths)?;
+        bind_daemon_listener(&paths).await?
+    };
+    loop {
+        let (stream, _) = listener.accept().await.map_err(|error| {
+            SingletonError::InvalidState(format!("accept daemon MCP connection: {error}"))
+        })?;
+        let server = SingletonMcpServer::new(broker.clone());
+        tokio::spawn(async move {
+            if let Ok(service) = server.serve(stream).await {
+                let _ = service.waiting().await;
+            }
+        });
+    }
+}
+
+async fn bind_daemon_listener(paths: &StatePaths) -> Result<UnixListener> {
+    if daemon_socket_ready(paths).await {
         return Err(SingletonError::InvalidState(format!(
             "daemon already listening on {}",
             paths.socket.display()
         )));
     }
-    remove_stale_socket(&paths)?;
+    remove_stale_socket(paths)?;
     if let Some(parent) = paths.socket.parent() {
         fs::create_dir_all(parent).map_err(|error| {
             SingletonError::Store(format!(
@@ -475,17 +639,7 @@ where
     fs::write(&paths.pid, std::process::id().to_string()).map_err(|error| {
         SingletonError::Store(format!("write {}: {error}", paths.pid.display()))
     })?;
-    loop {
-        let (stream, _) = listener.accept().await.map_err(|error| {
-            SingletonError::InvalidState(format!("accept daemon MCP connection: {error}"))
-        })?;
-        let server = SingletonMcpServer::new(broker.clone());
-        tokio::spawn(async move {
-            if let Ok(service) = server.serve(stream).await {
-                let _ = service.waiting().await;
-            }
-        });
-    }
+    Ok(listener)
 }
 
 async fn proxy_stdio_to_daemon(paths: StatePaths, backend: BackendKind) -> Result<()> {
@@ -513,12 +667,16 @@ async fn ensure_daemon_running(paths: &StatePaths, backend: BackendKind) -> Resu
     if daemon_socket_ready(paths).await {
         return Ok(());
     }
-    remove_stale_socket(paths)?;
+    let _lock = DaemonStartupLock::acquire(paths)?;
+    if daemon_socket_ready(paths).await {
+        return Ok(());
+    }
     let executable = std::env::current_exe().map_err(|error| {
         SingletonError::InvalidState(format!("locate singleton binary: {error}"))
     })?;
     let database_arg = paths.database.to_string_lossy().to_string();
-    let mut child = ProcessCommand::new(executable)
+    let mut command = ProcessCommand::new(executable);
+    command
         .args([
             "serve",
             "--daemon",
@@ -527,14 +685,17 @@ async fn ensure_daemon_running(paths: &StatePaths, backend: BackendKind) -> Resu
             "--database",
             &database_arg,
         ])
+        .env(DAEMON_STARTUP_LOCK_HELD_ENV, &paths.lock)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    command.process_group(0);
+    let mut child = command
         .spawn()
         .map_err(|error| SingletonError::InvalidState(format!("spawn singletond: {error}")))?;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if daemon_socket_ready(paths).await {
+        if inspect_daemon(paths).await?.state == DaemonState::Running {
             return Ok(());
         }
         if let Some(status) = child
@@ -562,6 +723,67 @@ async fn daemon_socket_ready(paths: &StatePaths) -> bool {
     )
     .await
     .is_ok_and(|result| result.is_ok())
+}
+
+fn daemon_startup_lock_is_held(paths: &StatePaths) -> bool {
+    std::env::var_os(DAEMON_STARTUP_LOCK_HELD_ENV)
+        .is_some_and(|value| value == paths.lock.as_os_str())
+}
+
+async fn inspect_daemon(paths: &StatePaths) -> Result<DaemonStatus> {
+    let socket = if daemon_socket_ready(paths).await {
+        SocketFileState::Listening
+    } else if paths.socket.exists() {
+        SocketFileState::Stale
+    } else {
+        SocketFileState::Missing
+    };
+    let pid = inspect_pid_file(paths)?;
+    let state = match (&pid, socket) {
+        (PidFileState::Alive(_), SocketFileState::Listening) => DaemonState::Running,
+        (PidFileState::Missing, SocketFileState::Missing) => DaemonState::Stopped,
+        (PidFileState::Dead(_) | PidFileState::Invalid(_), SocketFileState::Missing) => {
+            DaemonState::StalePid
+        }
+        (PidFileState::Missing, SocketFileState::Stale) => DaemonState::StaleSocket,
+        (PidFileState::Dead(_) | PidFileState::Invalid(_), SocketFileState::Stale) => {
+            DaemonState::StalePidAndSocket
+        }
+        (PidFileState::Alive(_), SocketFileState::Missing | SocketFileState::Stale)
+        | (
+            PidFileState::Missing | PidFileState::Dead(_) | PidFileState::Invalid(_),
+            SocketFileState::Listening,
+        ) => DaemonState::Degraded,
+    };
+    Ok(DaemonStatus { state, pid, socket })
+}
+
+fn inspect_pid_file(paths: &StatePaths) -> Result<PidFileState> {
+    if !paths.pid.exists() {
+        return Ok(PidFileState::Missing);
+    }
+    let pid_text = fs::read_to_string(&paths.pid)
+        .map_err(|error| SingletonError::Store(format!("read {}: {error}", paths.pid.display())))?;
+    let trimmed = pid_text.trim();
+    if trimmed.is_empty() {
+        return Ok(PidFileState::Invalid("<empty>".to_string()));
+    }
+    let pid = match trimmed.parse::<u32>() {
+        Ok(pid) => pid,
+        Err(_) => return Ok(PidFileState::Invalid(trimmed.to_string())),
+    };
+    if process_alive(pid)? {
+        Ok(PidFileState::Alive(pid))
+    } else {
+        Ok(PidFileState::Dead(pid))
+    }
+}
+
+fn cleanup_command(database: &Path) -> String {
+    format!(
+        "singleton stop --database {}",
+        shell_quote(&database.to_string_lossy())
+    )
 }
 
 fn process_alive(pid: u32) -> Result<bool> {
@@ -627,6 +849,7 @@ fn resolve_state_paths(database: Option<PathBuf>) -> Result<StatePaths> {
         .and_then(|stem| stem.to_str())
         .unwrap_or("singleton");
     let pid = directory.join(format!("{stem}.pid"));
+    let lock = directory.join(format!("{stem}.lock"));
     let candidate_socket = directory.join(format!("{stem}.sock"));
     let socket = if candidate_socket.to_string_lossy().len() < 100 {
         candidate_socket
@@ -639,6 +862,7 @@ fn resolve_state_paths(database: Option<PathBuf>) -> Result<StatePaths> {
         database,
         socket,
         pid,
+        lock,
     })
 }
 
