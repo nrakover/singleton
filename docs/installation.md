@@ -34,8 +34,9 @@ Supported launcher overrides:
 | `SINGLETON_BACKEND` | Override the backend passed to `serve`; defaults to `copilot`. |
 | `SINGLETON_DATABASE` | Pass an explicit singleton SQLite database path. |
 
-The plugin currently supports macOS arm64, macOS x86_64, and Linux x86_64
-release archives.
+The plugin currently supports macOS Apple Silicon and Linux x86_64 release
+archives. Other platforms should install from source and set `SINGLETON_BINARY`
+if they want to use the Copilot plugin launcher.
 
 Current Copilot CLI versions can also install repository plugins directly, for
 example `copilot plugin install nrakover/singleton:.github/plugin`, but Copilot
@@ -53,7 +54,6 @@ Tagged releases publish prebuilt archives named:
 
 ```text
 singleton-aarch64-apple-darwin.tar.gz
-singleton-x86_64-apple-darwin.tar.gz
 singleton-x86_64-unknown-linux-gnu.tar.gz
 ```
 

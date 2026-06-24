@@ -10,9 +10,6 @@ target_triple() {
   os="$(uname -s)"
   arch="$(uname -m)"
   case "${os}:${arch}" in
-    Darwin:x86_64)
-      printf 'x86_64-apple-darwin'
-      ;;
     Darwin:arm64|Darwin:aarch64)
       printf 'aarch64-apple-darwin'
       ;;

@@ -224,8 +224,8 @@ Current Phase 2 status:
 
 Packaging status:
 
-- A tag-driven GitHub Actions release workflow builds macOS arm64, macOS x86_64,
-  and Linux x86_64 release archives with matching SHA-256 files.
+- A tag-driven GitHub Actions release workflow builds macOS Apple Silicon and
+  Linux x86_64 release archives with matching SHA-256 files.
 - A Copilot CLI plugin manifest in the repository configures a `singleton` MCP
   server.
 - The plugin launcher installs/reuses a released binary in
