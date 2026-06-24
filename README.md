@@ -1,98 +1,97 @@
 # singleton
 
-`singleton` is a durable background agent session broker. It exposes a compact
-MCP server that any capable foreground agent can use to create, message,
-monitor, and clean up long-lived background agent sessions.
+`singleton` lets your foreground agent coordinate durable background agent
+sessions. It gives tools like Copilot CLI a small MCP control plane for starting
+background work, checking results later, handling approvals, and recovering state
+after the foreground chat exits.
 
-## Product direction
+Use it when you want your current agent to delegate independent work without
+losing track of the sessions it started.
 
-The foreground agent you are already using becomes the "hub" by convention: it
-calls singleton MCP tools to coordinate background sessions, handle approvals,
-fan in events, and summarize results. Singleton provides the durable control
-plane, not a foreground chat UI.
+## Quick start with Copilot CLI
 
-Core concepts:
+There are two pieces to install:
 
-- **Host**: compute/control endpoint such as local machine, SSH target, cloud
-  sandbox, or future AHP host.
-- **Workspace**: filesystem or repository context on a host, including local
-  paths and git worktrees.
-- **Session**: durable logical agent conversation/task container using an
-  agent backend and a default workspace.
-- **Turn**: one asynchronous request sent to a session.
-- **Inbox**: compact fan-in view of permission requests, input prompts, failed
-  turns, unread completions, and stale sessions.
+1. The native `singleton` binary, which gives you admin commands such as
+   `singleton status` and `singleton stop`.
+2. The foreground-agent plugin, which teaches Copilot how to use singleton over
+   MCP and installs the `singleton` Skill.
 
-## MVP target
+### 1. Install the binary
 
-- Rust `singletond` daemon
-- MCP control surface
-- SQLite durable store
-- local host connector
-- local git worktree workspace provider
-- GitHub Copilot SDK backend
-- deterministic fake backend for tests
-- CLI admin commands: `serve`, `start`, `status`, `stop`, `mcp-config`
+Download the latest archive for your platform from
+<https://github.com/nrakover/singleton/releases/latest>.
 
-Default MCP tools:
+Current prebuilt archives:
 
-- `get_capabilities`
-- `get_inbox`
-- `ack_inbox`
-- `ensure_workspace`
-- `create_session`
-- `send_message`
-- `read_events`
-- `get_latest_output`
-- `list_sessions`
-- `get_session`
-- `resolve_request`
-- `cancel_turn`
-- `close_resource`
+- `singleton-aarch64-apple-darwin.tar.gz` for macOS Apple Silicon
+- `singleton-x86_64-unknown-linux-gnu.tar.gz` for Linux x86_64
 
-## Architecture notes
+Install it somewhere on your `PATH`, for example:
 
-Singleton owns orchestration state, workspace lifecycle, request/approval
-state, and a normalized event index. The agent backend owns canonical
-conversation persistence and model runtime state. The workspace/filesystem owns
-source files, git index, commits, generated files, and untracked files.
+```bash
+mkdir -p "$HOME/.local/bin"
+tar -xzf singleton-aarch64-apple-darwin.tar.gz
+install -m 0755 singleton-*/singleton "$HOME/.local/bin/singleton"
+singleton status
+```
 
-AHP is an alignment target and future adapter surface. The near-term AHP role
-is singleton as a client/connector to external AHP hosts; AHP is not an MVP
-runtime dependency.
+Use the Linux archive name instead on Linux. If `singleton` is not found after
+installation, add your local bin directory to your shell startup file:
 
-## Development status
+```bash
+echo 'export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"' >> ~/.zshrc
+exec zsh
+```
 
-The repository contains the Rust broker implementation: a Cargo workspace,
-SQLite store, local host/worktree connector, fake backend, rmcp-backed MCP tool
-surface, Copilot SDK adapter, daemon-backed CLI, and tests. See:
+For bash, use `~/.bashrc` instead of `~/.zshrc`.
 
-- `spec/spec.md`
-- `spec/interfaces.md`
-- `spec/user_flows.md`
-- `spec/tests.md`
-- `project_tasks/2_agent-session-mcp-pivot.md`
-- `docs/foreground-agent-coordination.md`
-- `docs/installation.md`
-- `docs/remote-host-fast-follow.md`
-- `AGENTS.md`
+If you prefer building from source:
 
-## Installation
+```bash
+rustup toolchain install 1.94.0 --profile minimal
+cargo +1.94.0 install --locked \
+  --git https://github.com/nrakover/singleton \
+  singleton-cli --bin singleton
+```
 
-For Copilot CLI, the intended user path is the plugin:
+### 2. Install the Copilot plugin
 
 ```bash
 copilot plugin marketplace add nrakover/singleton
 copilot plugin install singleton@singleton
 ```
 
-The plugin contributes a `singleton` MCP server and a `singleton` Skill with the
-foreground-agent coordination cookbook. Its launcher installs the latest GitHub
-release binary into Copilot's plugin data directory when needed, then runs
-`singleton serve --stdio --backend copilot`. See
-`docs/installation.md` for release assets, overrides, and non-Copilot clients.
+The plugin contributes:
 
-For direct MCP registration after installing or building a binary:
+- a `singleton` MCP server for Copilot CLI
+- a `singleton` Skill with the foreground-agent coordination cookbook
+
+Start a new Copilot CLI session and ask it to use singleton for background work.
+For example:
+
+```text
+Use the singleton skill. Create a background session that replies exactly
+"singleton ok", then show me the latest output.
+```
+
+## Everyday commands
+
+```bash
+singleton status              # show daemon state and known sessions
+singleton stop                # stop the local daemon and clean stale files
+singleton start               # start/reuse the daemon explicitly
+singleton mcp-config          # print a manual MCP config snippet
+```
+
+`singleton serve --stdio` is the MCP entrypoint used by foreground-agent
+clients. It starts or reuses the local daemon and proxies MCP traffic to it, so
+background turns can keep running after the foreground client disconnects.
+
+## Other foreground agents
+
+After the binary is on your `PATH`, singleton can register itself with other MCP
+clients:
 
 ```bash
 singleton install-mcp --client copilot
@@ -100,49 +99,27 @@ singleton install-mcp --client claude
 singleton install-mcp --client codex
 ```
 
-`singleton mcp-config --backend copilot` remains available as a JSON escape
-hatch for clients that need manual MCP configuration.
+Use `--dry-run` to print the native client command without running it.
 
-## CLI smoke usage
+## How it works
 
-```bash
-cargo +1.94.0 run -p singleton-cli --bin singleton -- serve --once
-cargo +1.94.0 run -p singleton-cli --bin singleton -- serve --stdio
-cargo +1.94.0 run -p singleton-cli --bin singleton -- start --backend copilot
-cargo +1.94.0 run -p singleton-cli --bin singleton -- status
-cargo +1.94.0 run -p singleton-cli --bin singleton -- stop
-cargo +1.94.0 run -p singleton-cli --bin singleton -- mcp-config --backend copilot
-cargo +1.94.0 run -p singleton-cli --bin singleton -- install-mcp --client copilot --dry-run
-```
+Singleton owns orchestration state: sessions, turns, inbox items, requests,
+workspaces, daemon lifecycle, and a normalized event index. The agent backend
+owns the canonical conversation transcript. The filesystem and git own source
+files, commits, and untracked changes.
 
-`serve --stdio` is the foreground-agent entrypoint. It starts or reuses the
-local daemon, then proxies MCP newline JSON between stdio and the daemon's Unix
-socket so disconnecting the MCP client does not kill broker-owned background
-turns. `serve --stdio --direct` keeps the broker in the foreground for debugging.
+The current MVP is local-first and Copilot-backed:
 
-Daemon lifecycle commands are intentionally idempotent: `start` and
-`serve --stdio` reuse an already-listening daemon, while `serve --daemon` is the
-internal daemon entrypoint and fails if another daemon owns the socket. The
-auto-start path uses a per-database `.lock` file around socket cleanup, bind,
-and pid writes, and spawns the daemon into its own Unix process group through
-Rust's safe `CommandExt::process_group(0)` API. `status` reports `running`,
-`stopped`, `stale pid`, `stale socket`, `stale pid and socket`, or `degraded`
-states and prints `singleton stop --database ...` when stale files can be
-cleaned. `stop` remains safe to repeat and removes stale pid/socket files when
-no live daemon owns them.
+- Rust `singleton` daemon and CLI
+- SQLite durable state
+- MCP tool surface for foreground agents
+- GitHub Copilot SDK backend
+- local workspace and git worktree support
+- deterministic fake backend for tests
 
-## Planned verification
+## More documentation
 
-Rust implementation work should pass:
-
-```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets
-```
-
-Live Copilot-backed tests should be ignored by default and run explicitly:
-
-```bash
-cargo test --workspace --features live-copilot -- --ignored
-```
+- `docs/installation.md` for detailed install options and plugin overrides
+- `docs/foreground-agent-coordination.md` for the coordination model
+- `spec/` for behavioral and interface specs
+- `AGENTS.md` for contributor/agent development guidance
