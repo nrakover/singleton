@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+fs2.workspace = true
 singleton-broker = { path = "../singleton-broker" }
 singleton-copilot = { path = "../singleton-copilot" }
 singleton-core = { path = "../singleton-core" }

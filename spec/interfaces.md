@@ -17,12 +17,12 @@ The `singleton` binary exposes these public commands:
 
 | Command | Purpose |
 |---|---|
-| `serve --stdio` | Foreground-agent MCP entrypoint; starts/reuses the daemon and proxies stdio to its Unix socket. |
+| `serve --stdio` | Foreground-agent MCP entrypoint; idempotently starts/reuses the daemon and proxies stdio to its Unix socket. |
 | `serve --stdio --direct` | Debug MCP server with broker in the foreground. |
-| `serve --daemon` | Internal daemon process entrypoint; fails if the daemon socket is already owned. |
+| `serve --daemon` | Internal daemon process entrypoint; serializes startup and fails if the daemon socket is already owned. |
 | `start` | Idempotently start/reuse the daemon for a selected database/backend. |
-| `status` | Print daemon state, database path, socket path, and sessions. |
-| `stop` | Stop the daemon and clean stale pid/socket files. |
+| `status` | Print daemon lifecycle state, database path, pid/socket/lock paths, cleanup guidance, and sessions. |
+| `stop` | Stop the daemon and idempotently clean stale pid/socket files. |
 | `mcp-config` | Print a JSON MCP server snippet for manual client configuration. |
 | `install-mcp` | Register singleton with a supported MCP client using that client's native command. |
 
@@ -688,11 +688,37 @@ starts or reuses the daemon and proxies stdio to a local Unix socket so MCP
 client disconnects do not kill background turns. `serve --stdio --direct` runs
 the broker directly on stdio for debugging.
 
+The default auto-start path serializes startup with a sibling daemon lock file,
+then spawns `serve --daemon` into a separate Unix process group through Rust's
+safe `CommandExt::process_group(0)` API. The lock protects stale socket cleanup,
+socket bind, and pid writes for one database. `serve --daemon` is not an
+idempotent user command: if the socket is already accepting connections, it
+returns a clear "daemon already listening" error.
+
+`status` daemon states:
+
+| State | Meaning |
+|---|---|
+| `running` | Socket accepts connections and pid file points at a live process. |
+| `stopped` | No pid file and no socket file are present. |
+| `stale pid` | A pid file exists but the process is gone or invalid. |
+| `stale socket` | A socket path exists but is not accepting connections. |
+| `stale pid and socket` | Both stale lifecycle files are present. |
+| `degraded` | Mixed lifecycle state, such as a live pid without a socket or a live socket with an unusable pid file. |
+
+For stale states, `status` prints the exact `singleton stop --database ...`
+cleanup command. `stop` may be repeated safely; it signals a live pid when one
+is available, otherwise removes stale pid/socket files. If a socket is live but
+the pid file is missing or unusable, `stop` refuses to unlink the live socket
+because it cannot safely identify the daemon process.
+
 State path rules:
 
 - default database: `~/.singleton/singleton.db`
-- default socket/pid: sibling `singleton.sock` and `singleton.pid`
-- explicit `--database /path/name.db`: sibling `name.sock` and `name.pid`
+- default socket/pid/lock: sibling `singleton.sock`, `singleton.pid`, and
+  `singleton.lock`
+- explicit `--database /path/name.db`: sibling `name.sock`, `name.pid`, and
+  `name.lock`
 - long socket paths are hashed into the system temp directory to satisfy Unix
   socket path limits
 

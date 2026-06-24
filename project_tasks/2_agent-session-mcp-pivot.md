@@ -206,6 +206,10 @@ Current Phase 2 status:
   turns. `serve --stdio --direct` remains available for foreground debugging.
 - `singleton start`, `singleton status`, and `singleton stop` manage daemon
   pid/socket lifecycle for a selected state database.
+- Daemon lifecycle hardening now detaches auto-started daemons into their own
+  Unix process group, serializes per-database startup with a lock file around
+  socket cleanup/bind/pid writes, reports stale pid/socket/degraded lifecycle
+  states, and keeps `start`, `serve --stdio`, and `stop` idempotent where safe.
 - `singleton mcp-config --backend copilot` prints an MCP server config snippet
   using the daemon-backed stdio entrypoint.
 - `singleton install-mcp --client copilot|claude|codex` registers the

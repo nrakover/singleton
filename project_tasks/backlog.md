@@ -22,19 +22,20 @@ Purpose: curated follow-up work for the Rust MCP session broker pivot.
 
 ## MCP and daemon usability
 
-- Detach the auto-started daemon from the foreground MCP proxy process group so
-  exiting Copilot CLI does not kill the daemon when the MCP child process tree is
-  torn down.
-- Add an interprocess daemon startup lock around socket cleanup/bind/pid writes
-  so concurrent foreground MCP proxies cannot race while auto-starting the same
-  daemon.
-- Teach `singleton status` to report stale pid/socket files explicitly, and
-  either clean them automatically or print the exact `singleton stop` cleanup
-  command.
-- Document command semantics: `singleton start` and `singleton serve --stdio`
-  should be idempotent when the daemon is already running, while
-  `singleton serve --daemon` should fail clearly if another daemon owns the
-  state database.
+Completed P0 daemon lifecycle hardening:
+
+- Auto-started daemons are spawned into their own Unix process group via Rust's
+  safe standard-library process-group API.
+- Daemon startup is serialized per state database with a lock file around stale
+  socket cleanup, bind, and pid writes.
+- `singleton status` reports running, stopped, stale pid, stale socket, combined
+  stale pid/socket, and degraded states with cleanup guidance.
+- `singleton start` and `singleton serve --stdio` are idempotent when the daemon
+  is already running; `singleton serve --daemon` fails clearly if another daemon
+  owns the state database.
+
+Remaining MCP and daemon usability follow-ups:
+
 - Add a compact `get_latest_output` or summarized turn-result field so
   foreground agents do not need to inspect large raw SDK event payloads to find
   the final assistant answer.

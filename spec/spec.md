@@ -34,7 +34,23 @@ The daemon does not own a user-facing hub session or terminal UI.
 Foreground MCP clients should connect through `singleton serve --stdio`, which
 acts as a stdio proxy to the daemon's local Unix socket. The proxy may exit when
 the foreground agent disconnects; the daemon and its background turn tasks keep
-running until `singleton stop` or process termination.
+running until `singleton stop` or process termination. The auto-started daemon
+is launched in its own Unix process group using Rust's safe standard-library
+process-group API, so ordinary foreground-client process-group teardown does not
+signal daemon-owned turns.
+
+Daemon startup is serialized per state database with a sibling lock file. The
+lock covers stale socket cleanup, socket bind, and pid file writes so concurrent
+`serve --stdio` proxies or `start` commands cannot race while creating the same
+local daemon. `singleton start` and `serve --stdio` are idempotent when a daemon
+is already listening; `serve --daemon` is the internal daemon entrypoint and
+fails clearly if another process already owns the daemon socket.
+
+`singleton status` reports lifecycle health as `running`, `stopped`,
+`stale pid`, `stale socket`, `stale pid and socket`, or `degraded`, including
+pid/socket paths and cleanup guidance for stale files. `singleton stop` is
+idempotent and cleans stale pid/socket files when no live socket is owned by a
+daemon with an unusable pid file.
 
 ### 2.1.1 Installation and client registration
 

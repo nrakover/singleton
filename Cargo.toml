@@ -21,6 +21,7 @@ repository = "https://github.com/nrakover/singleton"
 async-trait = "0.1.89"
 clap = { version = "4.5.54", features = ["derive"] }
 futures-core = "0.3.31"
+fs2 = "0.4.3"
 github-copilot-sdk = { version = "1.0.3", default-features = false }
 rmcp = { version = "1.8.0", features = ["server", "transport-io"] }
 rusqlite = { version = "0.37.0", features = ["bundled", "serde_json"] }

@@ -29,6 +29,11 @@ Copilot stores MCP configuration.
 - Users can pin a release with `SINGLETON_VERSION`.
 - Users can bypass the plugin with `singleton install-mcp --client copilot` or
   manual `singleton mcp-config` output.
+- Repeated foreground starts reuse the same daemon. The daemon is auto-started
+  under a per-database startup lock and in a separate Unix process group so
+  ordinary foreground-client shutdown does not terminate background turns.
+- If lifecycle files are stale, `singleton status` identifies the stale pid or
+  socket and prints the `singleton stop --database ...` cleanup command.
 - Direct repository plugin installs are deprecated by Copilot CLI, so the
   marketplace flow is the canonical install path.
 

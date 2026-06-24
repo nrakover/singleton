@@ -158,6 +158,9 @@ Coverage:
 - `singleton status` reads broker state
 - `singleton start`, `singleton status`, and `singleton stop` manage pid/socket
   daemon lifecycle
+- daemon lifecycle tests cover idempotent fake-backend start/stop, stale
+  pid/socket reporting and cleanup guidance, concurrent startup serialization,
+  and safe process-group isolation for auto-started daemons
 - `singleton mcp-config --backend copilot` prints an MCP server config snippet
 - `singleton install-mcp --client copilot|claude|codex --dry-run` builds the
   expected native MCP registration commands
