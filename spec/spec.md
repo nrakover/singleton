@@ -36,6 +36,40 @@ acts as a stdio proxy to the daemon's local Unix socket. The proxy may exit when
 the foreground agent disconnects; the daemon and its background turn tasks keep
 running until `singleton stop` or process termination.
 
+### 2.1.1 Installation and client registration
+
+The primary Copilot CLI installation path is a Copilot plugin in this
+repository. Installing the plugin configures a `singleton` MCP server without
+requiring users to locate or edit Copilot's MCP JSON files:
+
+```bash
+copilot plugin marketplace add nrakover/singleton
+copilot plugin install singleton@singleton
+```
+
+The plugin launcher must:
+
+- keep stdout reserved for MCP JSON-RPC once the foreground client starts it
+- write bootstrap diagnostics to stderr
+- use `${COPILOT_PLUGIN_DATA}` as persistent writable storage
+- install or reuse a released `singleton` binary for the current platform
+- exec `singleton serve --stdio --backend copilot`
+
+Supported launcher overrides include `SINGLETON_BINARY`,
+`SINGLETON_VERSION`, `SINGLETON_RELEASE_BASE_URL`,
+`SINGLETON_FORCE_INSTALL`, `SINGLETON_BACKEND`, and `SINGLETON_DATABASE`.
+
+Direct CLI registration remains available for Copilot CLI, Claude Code, Codex,
+and other stdio MCP clients:
+
+```bash
+singleton install-mcp --client copilot
+singleton install-mcp --client claude
+singleton install-mcp --client codex
+```
+
+`singleton mcp-config` remains the manual JSON escape hatch.
+
 ### 2.2 Foreground agent
 
 A foreground agent is any MCP-capable agent currently interacting with the

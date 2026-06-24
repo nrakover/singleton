@@ -62,6 +62,20 @@ enum Command {
         #[arg(long)]
         database: Option<PathBuf>,
     },
+    InstallMcp {
+        #[arg(long, value_enum)]
+        client: McpClientKind,
+        #[arg(long, default_value = "singleton")]
+        name: String,
+        #[arg(long, value_enum, default_value = "copilot")]
+        backend: BackendKind,
+        #[arg(long)]
+        database: Option<PathBuf>,
+        #[arg(long)]
+        binary: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -75,6 +89,23 @@ impl BackendKind {
         match self {
             Self::Fake => "fake",
             Self::Copilot => "copilot",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum McpClientKind {
+    Copilot,
+    Claude,
+    Codex,
+}
+
+impl McpClientKind {
+    fn command_name(self) -> &'static str {
+        match self {
+            Self::Copilot => "copilot",
+            Self::Claude => "claude",
+            Self::Codex => "codex",
         }
     }
 }
@@ -113,6 +144,14 @@ async fn main() -> Result<()> {
         Command::Status { database } => status(database).await,
         Command::Stop { database } => stop(database).await,
         Command::McpConfig { backend, database } => mcp_config(backend, database),
+        Command::InstallMcp {
+            client,
+            name,
+            backend,
+            database,
+            binary,
+            dry_run,
+        } => install_mcp(client, &name, backend, database, binary, dry_run),
     }
 }
 
@@ -204,9 +243,113 @@ async fn stop(database: Option<PathBuf>) -> Result<()> {
 }
 
 fn mcp_config(backend: BackendKind, database: Option<PathBuf>) -> Result<()> {
-    let executable = std::env::current_exe().map_err(|error| {
-        SingletonError::InvalidState(format!("locate singleton binary: {error}"))
-    })?;
+    let executable = resolve_singleton_binary(None)?;
+    let args = singleton_server_args(backend, database);
+    let config = json!({
+        "mcpServers": {
+            "singleton": {
+                "command": executable,
+                "args": args
+            }
+        }
+    });
+    let rendered = serde_json::to_string_pretty(&config)
+        .map_err(|error| SingletonError::InvalidState(format!("render MCP config: {error}")))?;
+    println!("{rendered}");
+    Ok(())
+}
+
+fn install_mcp(
+    client: McpClientKind,
+    name: &str,
+    backend: BackendKind,
+    database: Option<PathBuf>,
+    binary: Option<PathBuf>,
+    dry_run: bool,
+) -> Result<()> {
+    let command = install_mcp_command(client, name, backend, database, binary)?;
+    if dry_run {
+        println!("{}", command.render_shell());
+        return Ok(());
+    }
+    let status = ProcessCommand::new(&command.program)
+        .args(&command.args)
+        .status()
+        .map_err(|error| {
+            SingletonError::InvalidState(format!(
+                "run MCP installer '{}': {error}",
+                command.render_shell()
+            ))
+        })?;
+    if !status.success() {
+        return Err(SingletonError::InvalidState(format!(
+            "{} exited with {status}",
+            command.program
+        )));
+    }
+    println!(
+        "registered MCP server '{name}' with {}",
+        client.command_name()
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommandSpec {
+    program: String,
+    args: Vec<String>,
+}
+
+impl CommandSpec {
+    fn render_shell(&self) -> String {
+        std::iter::once(self.program.as_str())
+            .chain(self.args.iter().map(String::as_str))
+            .map(shell_quote)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+fn install_mcp_command(
+    client: McpClientKind,
+    name: &str,
+    backend: BackendKind,
+    database: Option<PathBuf>,
+    binary: Option<PathBuf>,
+) -> Result<CommandSpec> {
+    let binary = resolve_singleton_binary(binary)?;
+    let mut server_args = vec![binary];
+    server_args.extend(singleton_server_args(backend, database));
+    let mut args = match client {
+        McpClientKind::Copilot => vec!["mcp".into(), "add".into(), name.into(), "--".into()],
+        McpClientKind::Claude => vec![
+            "mcp".into(),
+            "add".into(),
+            "--transport".into(),
+            "stdio".into(),
+            name.into(),
+            "--".into(),
+        ],
+        McpClientKind::Codex => vec!["mcp".into(), "add".into(), name.into(), "--".into()],
+    };
+    args.extend(server_args);
+    Ok(CommandSpec {
+        program: client.command_name().into(),
+        args,
+    })
+}
+
+fn resolve_singleton_binary(binary: Option<PathBuf>) -> Result<String> {
+    let binary = match binary {
+        Some(binary) => binary,
+        None => std::env::current_exe().map_err(|error| {
+            SingletonError::InvalidState(format!("locate singleton binary: {error}"))
+        })?,
+    };
+    Ok(binary.to_string_lossy().to_string())
+}
+
+fn singleton_server_args(backend: BackendKind, database: Option<PathBuf>) -> Vec<String> {
     let mut args = vec![
         "serve".to_string(),
         "--stdio".to_string(),
@@ -217,18 +360,31 @@ fn mcp_config(backend: BackendKind, database: Option<PathBuf>) -> Result<()> {
         args.push("--database".to_string());
         args.push(database.to_string_lossy().to_string());
     }
-    let config = json!({
-        "mcpServers": {
-            "singleton": {
-                "command": executable.to_string_lossy(),
-                "args": args
-            }
-        }
-    });
-    let rendered = serde_json::to_string_pretty(&config)
-        .map_err(|error| SingletonError::InvalidState(format!("render MCP config: {error}")))?;
-    println!("{rendered}");
-    Ok(())
+    args
+}
+
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'A'..=b'Z'
+                    | b'a'..=b'z'
+                    | b'0'..=b'9'
+                    | b'/'
+                    | b'.'
+                    | b'_'
+                    | b'-'
+                    | b':'
+                    | b'='
+                    | b'+'
+            )
+        })
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
 }
 
 async fn run_backend(database: PathBuf, backend: BackendKind, mode: ServeMode) -> Result<()> {
@@ -533,5 +689,113 @@ mod tests {
             Some("sock")
         );
         Ok(())
+    }
+
+    #[test]
+    fn install_mcp_builds_copilot_command() -> Result<()> {
+        let command = install_mcp_command(
+            McpClientKind::Copilot,
+            "singleton",
+            BackendKind::Copilot,
+            None,
+            Some(PathBuf::from("/usr/local/bin/singleton")),
+        )?;
+        assert_eq!(command.program, "copilot");
+        assert_eq!(
+            command.args,
+            strings(&[
+                "mcp",
+                "add",
+                "singleton",
+                "--",
+                "/usr/local/bin/singleton",
+                "serve",
+                "--stdio",
+                "--backend",
+                "copilot"
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn install_mcp_builds_claude_command_with_database() -> Result<()> {
+        let command = install_mcp_command(
+            McpClientKind::Claude,
+            "singleton-dev",
+            BackendKind::Fake,
+            Some(PathBuf::from("/tmp/singleton.db")),
+            Some(PathBuf::from("/opt/singleton/bin/singleton")),
+        )?;
+        assert_eq!(command.program, "claude");
+        assert_eq!(
+            command.args,
+            strings(&[
+                "mcp",
+                "add",
+                "--transport",
+                "stdio",
+                "singleton-dev",
+                "--",
+                "/opt/singleton/bin/singleton",
+                "serve",
+                "--stdio",
+                "--backend",
+                "fake",
+                "--database",
+                "/tmp/singleton.db"
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn install_mcp_builds_codex_command() -> Result<()> {
+        let command = install_mcp_command(
+            McpClientKind::Codex,
+            "singleton",
+            BackendKind::Copilot,
+            None,
+            Some(PathBuf::from("singleton")),
+        )?;
+        assert_eq!(command.program, "codex");
+        assert_eq!(
+            command.args,
+            strings(&[
+                "mcp",
+                "add",
+                "singleton",
+                "--",
+                "singleton",
+                "serve",
+                "--stdio",
+                "--backend",
+                "copilot"
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn command_spec_renders_shell_safe_dry_run() {
+        let command = CommandSpec {
+            program: "copilot".into(),
+            args: vec![
+                "mcp".into(),
+                "add".into(),
+                "singleton dev".into(),
+                "--".into(),
+                "/Applications/singleton bin/singleton".into(),
+                "serve".into(),
+            ],
+        };
+        assert_eq!(
+            command.render_shell(),
+            "copilot mcp add 'singleton dev' -- '/Applications/singleton bin/singleton' serve"
+        );
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
     }
 }

@@ -1,5 +1,64 @@
 # singleton - User Flows
 
+## 0. Install and Configure Copilot CLI
+
+### Goal
+
+Install singleton for Copilot CLI without requiring the user to know where
+Copilot stores MCP configuration.
+
+### Flow
+
+1. User runs `copilot plugin marketplace add nrakover/singleton`.
+2. User runs `copilot plugin install singleton@singleton`.
+3. Copilot installs the plugin and loads its `singleton` MCP server definition.
+4. On first MCP server start, the plugin launcher resolves the platform.
+5. The launcher downloads the latest release archive and checksum into a
+   temporary directory, verifies the checksum, and installs the binary into
+   `${COPILOT_PLUGIN_DATA}/bin`.
+6. The launcher execs `singleton serve --stdio --backend copilot`.
+7. `singleton serve --stdio` starts or reuses the local daemon and proxies MCP
+   stdio to the daemon socket.
+
+### Expected behavior
+
+- Plugin bootstrap diagnostics go to stderr, never MCP stdout.
+- Repeated starts reuse the installed binary unless `SINGLETON_FORCE_INSTALL=1`
+  or `SINGLETON_BINARY` overrides the path.
+- Users can pin a release with `SINGLETON_VERSION`.
+- Users can bypass the plugin with `singleton install-mcp --client copilot` or
+  manual `singleton mcp-config` output.
+- Direct repository plugin installs are deprecated by Copilot CLI, so the
+  marketplace flow is the canonical install path.
+
+---
+
+## 0.1 Direct MCP Client Registration
+
+### Goal
+
+Configure a foreground agent client after `singleton` is already installed.
+
+### Flow
+
+1. User installs or builds a `singleton` binary.
+2. User runs `singleton install-mcp --client copilot`, `--client claude`, or
+   `--client codex`.
+3. Singleton builds the client-native registration command.
+4. If `--dry-run` is set, singleton prints the command.
+5. Otherwise singleton runs the client command and reports success or the native
+   command failure.
+
+### Expected behavior
+
+- Generated registrations point at `singleton serve --stdio --backend copilot`
+  by default.
+- `--binary`, `--backend`, `--database`, and `--name` customize the generated
+  MCP server.
+- `install-mcp` does not edit client config files directly.
+
+---
+
 ## 1. Foreground Agent as Coordinator
 
 ### Goal

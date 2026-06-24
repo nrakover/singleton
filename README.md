@@ -72,8 +72,34 @@ surface, Copilot SDK adapter, daemon-backed CLI, and tests. See:
 - `spec/tests.md`
 - `project_tasks/2_agent-session-mcp-pivot.md`
 - `docs/foreground-agent-coordination.md`
+- `docs/installation.md`
 - `docs/remote-host-fast-follow.md`
 - `AGENTS.md`
+
+## Installation
+
+For Copilot CLI, the intended user path is the plugin:
+
+```bash
+copilot plugin marketplace add nrakover/singleton
+copilot plugin install singleton@singleton
+```
+
+The plugin contributes a `singleton` MCP server. Its launcher installs the
+latest GitHub release binary into Copilot's plugin data directory when needed,
+then runs `singleton serve --stdio --backend copilot`. See
+`docs/installation.md` for release assets, overrides, and non-Copilot clients.
+
+For direct MCP registration after installing or building a binary:
+
+```bash
+singleton install-mcp --client copilot
+singleton install-mcp --client claude
+singleton install-mcp --client codex
+```
+
+`singleton mcp-config --backend copilot` remains available as a JSON escape
+hatch for clients that need manual MCP configuration.
 
 ## CLI smoke usage
 
@@ -84,6 +110,7 @@ cargo +1.94.0 run -p singleton-cli --bin singleton -- start --backend copilot
 cargo +1.94.0 run -p singleton-cli --bin singleton -- status
 cargo +1.94.0 run -p singleton-cli --bin singleton -- stop
 cargo +1.94.0 run -p singleton-cli --bin singleton -- mcp-config --backend copilot
+cargo +1.94.0 run -p singleton-cli --bin singleton -- install-mcp --client copilot --dry-run
 ```
 
 `serve --stdio` is the foreground-agent entrypoint. It starts or reuses the

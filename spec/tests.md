@@ -159,11 +159,36 @@ Coverage:
 - `singleton start`, `singleton status`, and `singleton stop` manage pid/socket
   daemon lifecycle
 - `singleton mcp-config --backend copilot` prints an MCP server config snippet
+- `singleton install-mcp --client copilot|claude|codex --dry-run` builds the
+  expected native MCP registration commands
 - stdio `initialize`, `tools/list`, and `tools/call` work against the fake
   backend for a create/send/read-events vertical slice
 - CLI output is human-readable and stable enough for smoke tests
 
 CLI tests should avoid depending on long-running external services.
+
+### 2.8 Packaging and plugin tests
+
+Coverage:
+
+- release workflow builds `singleton` for supported macOS/Linux targets and
+  publishes `.tar.gz` archives plus `.sha256` files on `v*.*.*` tags
+- release archives contain an executable `singleton` binary
+- Copilot marketplace manifest points at the plugin subdirectory
+- Copilot plugin manifest points to the MCP config file
+- plugin MCP config starts the launcher through `bash`
+- plugin launcher shell script passes syntax checks
+- plugin launcher writes bootstrap diagnostics to stderr, not stdout
+- plugin launcher supports `SINGLETON_BINARY`, `SINGLETON_VERSION`,
+  `SINGLETON_RELEASE_BASE_URL`, `SINGLETON_FORCE_INSTALL`,
+  `SINGLETON_BACKEND`, and `SINGLETON_DATABASE`
+- local `copilot plugin marketplace add PATH` plus
+  `copilot plugin install singleton@singleton` succeeds when Copilot CLI is
+  available
+
+Packaging tests should not download release assets in the default unit test
+gate. Networked release/download checks belong in release or manual smoke
+validation.
 
 ---
 
@@ -226,6 +251,17 @@ These scenarios should run with fake backend and temporary local workspaces.
 5. Close second session.
 6. Delete workspace.
 7. Repeat delete and assert idempotent success.
+
+### 3.6 Copilot plugin smoke
+
+1. Build or install a local singleton binary.
+2. Run `copilot plugin marketplace add PATH_TO_CLEAN_REPO`.
+3. Run `copilot plugin install singleton@singleton`.
+4. Start a new Copilot CLI session.
+5. Verify the `singleton` MCP tools are listed.
+6. Call `get_capabilities`, `create_session`, `send_message`, and
+   `read_events`.
+7. Uninstall the local plugin.
 
 ---
 

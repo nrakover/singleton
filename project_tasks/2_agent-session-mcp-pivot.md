@@ -48,10 +48,12 @@ tools.
 - local git worktree workspace provider
 - GitHub Copilot SDK backend
 - deterministic fake backend for tests
-- CLI admin commands: `serve`, `start`, `status`, `stop`, `mcp-config`
+- CLI admin commands: `serve`, `start`, `status`, `stop`, `mcp-config`,
+  `install-mcp`
 - sequence-numbered event stream
 - fan-in inbox
 - safe/idempotent cleanup
+- Copilot CLI plugin and release-binary packaging
 
 ### Explicitly out of scope for MVP
 
@@ -206,6 +208,9 @@ Current Phase 2 status:
   pid/socket lifecycle for a selected state database.
 - `singleton mcp-config --backend copilot` prints an MCP server config snippet
   using the daemon-backed stdio entrypoint.
+- `singleton install-mcp --client copilot|claude|codex` registers the
+  daemon-backed stdio entrypoint with supported MCP clients through their native
+  CLI commands.
 - Broker startup now resumes persisted backend sessions when supported and only
   preserves active turns when the backend also supports active-turn reattach.
   Otherwise active turns are failed/unread with retryable interruption events.
@@ -216,6 +221,16 @@ Current Phase 2 status:
   completion when run with `--features live-copilot -- --ignored`.
 - Ignored live CLI smoke covers `singleton serve --backend copilot --stdio`
   through MCP initialize/create/send/read-events.
+
+Packaging status:
+
+- A tag-driven GitHub Actions release workflow builds macOS arm64, macOS x86_64,
+  and Linux x86_64 release archives with matching SHA-256 files.
+- A Copilot CLI plugin manifest in the repository configures a `singleton` MCP
+  server.
+- The plugin launcher installs/reuses a released binary in
+  `${COPILOT_PLUGIN_DATA}` and then execs `singleton serve --stdio --backend
+  copilot`.
 
 ### Phase 3: hub convention docs
 

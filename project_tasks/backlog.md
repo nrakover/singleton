@@ -51,6 +51,17 @@ Purpose: curated follow-up work for the Rust MCP session broker pivot.
 - Decide whether inbox read state should be global or per-foreground-client
   before multi-operator workflows become common.
 
+## Packaging and installation
+
+- Publish `singleton-cli` to crates.io once the binary name/package layout is
+  stable enough for `cargo install singleton`.
+- Add Homebrew distribution for macOS users who do not want to use Cargo or the
+  Copilot plugin bootstrapper.
+- Add Windows release artifacts and plugin launcher support after the daemon
+  transport story has a Windows equivalent to Unix sockets.
+- Decide whether to add `singleton self-update` or keep updates delegated to
+  Copilot plugin updates, Homebrew, Cargo, and GitHub Releases.
+
 ## Foreground-agent hub convention
 
 - Write coordinator prompt snippets for MCP-capable foreground agents.
