@@ -25,11 +25,11 @@ the foreground session.
 4. Monitor sessions in a round-robin loop with
    `read_events({ session_id, cursor, wait_ms })` plus `get_inbox`. Do not
    block indefinitely on a single session.
-5. When a turn completes, read enough events to summarize the result, then
-   `ack_inbox` the handled completed or failed turn. If `get_capabilities`
-   advertises a compact latest-output tool such as `get_latest_output`, prefer
-   that for final assistant output; otherwise use current `read_events` and
-   `get_session` data.
+5. When a turn completes, prefer
+   `get_latest_output({ session_id, turn_id })` for final assistant output when
+   `get_capabilities` advertises it. Fall back to `read_events` only when the
+   tool is unavailable or its result says `needs_event_inspection: true`, then
+   `ack_inbox` the handled completed or failed turn.
 6. Resolve pending requests from `get_inbox` with `resolve_request`. Approve
    only when policy or the user permits it; deny unsafe or out-of-scope requests
    with a clear reason; answer input requests with `decision: "respond"` and
@@ -47,10 +47,12 @@ Use `get_inbox` as the fan-in primitive:
   `resolve_request({ request_id, decision, response, reason })`.
 - `input_request`: gather the missing input, then
   `resolve_request({ request_id, decision: "respond", response })`.
-- `completed_turn`: call `read_events` or a compact latest-output tool if
-  available, summarize the result, then `ack_inbox({ turn_id })`.
-- `failed_turn`: call `read_events`, decide whether to retry, cancel, or report
-  failure, then `ack_inbox({ turn_id })`.
+- `completed_turn`: call `get_latest_output({ session_id, turn_id })` when
+  available, summarize the result, inspect raw events only if requested, then
+  `ack_inbox({ turn_id })`.
+- `failed_turn`: call `get_latest_output({ session_id, turn_id })` when
+  available, inspect raw events only if requested, decide whether to retry,
+  cancel, or report failure, then `ack_inbox({ turn_id })`.
 
 Keep inbox summaries short. Acknowledge only after the foreground agent has
 handled the item.
@@ -74,7 +76,9 @@ hub transcript:
 2. Call `get_inbox`.
 3. Call `list_sessions` to find running, idle, and needs-input sessions.
 4. Call `get_session` for each relevant session.
-5. Resume event cursors from the last known cursor. If no cursor survived, read
+5. Call `get_latest_output({ session_id })` for unread completed or failed
+   turns when the tool is available.
+6. Resume event cursors from the last known cursor. If no cursor survived, read
    the relevant session events from the beginning or latest safe checkpoint and
    rebuild the foreground summary.
 

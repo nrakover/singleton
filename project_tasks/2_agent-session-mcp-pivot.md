@@ -80,6 +80,7 @@ The default MCP profile exposes only:
 - `create_session`
 - `send_message`
 - `read_events`
+- `get_latest_output`
 - `list_sessions`
 - `get_session`
 - `resolve_request`
@@ -221,6 +222,9 @@ Current Phase 2 status:
 - Cancelling or interrupting a turn now cancels pending requests for that turn so
   backend permission/input/elicitation handlers can unblock.
 - `ack_inbox` marks unread completed/failed turn inbox items as read.
+- `get_latest_output` returns compact latest turn results without overloading
+  monotonic `read_events` cursor semantics; unknown Copilot payload shapes ask
+  foreground agents to inspect raw events instead of guessing result text.
 - Ignored live Copilot smoke covers real SDK session creation plus send/event
   completion when run with `--features live-copilot -- --ignored`.
 - Ignored live CLI smoke covers `singleton serve --backend copilot --stdio`

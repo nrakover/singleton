@@ -30,8 +30,10 @@ Default loop:
 5. Poll read_events and get_inbox. Do not block indefinitely on one session.
 6. Resolve permission/input requests with resolve_request after applying policy
    or asking the user.
-7. Summarize completed turns, failures, and open questions.
-8. Close sessions and disposable workspaces with close_resource.
+7. Use get_latest_output for completed or failed turns before inspecting raw
+   events; inspect raw events only when needs_event_inspection is true.
+8. Summarize completed turns, failures, and open questions.
+9. Close sessions and disposable workspaces with close_resource.
 
 Do not assume singleton owns the backend transcript. Use singleton events for
 orchestration state and ask the backend session for conversation details only
@@ -59,8 +61,9 @@ Use when a background session will modify a repository.
      message: "Add parser validation tests and run the relevant test target."
    })
 4. read_events({ session_id, cursor, wait_ms: 30000 })
-5. get_inbox()
-6. close_resource({ target: { session_id }, disposition: "archive" })
+5. get_latest_output({ session_id, turn_id })
+6. get_inbox()
+7. close_resource({ target: { session_id }, disposition: "archive" })
 ```
 
 Cleanup should target the workspace separately:
@@ -118,18 +121,23 @@ loop:
       resolve_request({ request_id: item.request_id, decision: "respond", response })
 
     if item.kind == "failed_turn":
-      read_events({ session_id: item.session_id, cursor: last_cursor })
+      output = get_latest_output({ session_id: item.session_id, turn_id: item.turn_id })
+      if output.needs_event_inspection:
+        read_events({ resource_uri: output.turn_resource_uri, cursor: 0 })
       decide whether to retry, cancel, or report failure
       ack_inbox({ turn_id: item.turn_id })
 
     if item.kind == "completed_turn":
-      read_events({ session_id: item.session_id, cursor: last_cursor })
+      output = get_latest_output({ session_id: item.session_id, turn_id: item.turn_id })
+      if output.needs_event_inspection:
+        read_events({ resource_uri: output.turn_resource_uri, cursor: 0 })
       summarize the result
       ack_inbox({ turn_id: item.turn_id })
 ```
 
-Keep inbox summaries short. Use `read_events` for detail, then acknowledge
-handled turn items so they do not stay in the unread inbox.
+Keep inbox summaries short. Use `get_latest_output` for the compact result, fall
+back to `read_events` only when requested by `needs_event_inspection`, then
+acknowledge handled turn items so they do not stay in the unread inbox.
 
 ## Approval policy prompt
 
@@ -181,6 +189,7 @@ When a new foreground agent takes over:
 3. list_sessions({ statuses: ["running", "idle", "needs_input"] })
 4. get_session({ session_id }) for each relevant session
 5. read_events({ session_id, cursor: latest_known_cursor })
+6. get_latest_output({ session_id }) for unread completed or failed turns
 ```
 
 The foreground agent should not need a singleton-owned hub transcript to

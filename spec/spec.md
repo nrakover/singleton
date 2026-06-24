@@ -102,7 +102,8 @@ This is the new hub convention:
 
 1. The user asks the foreground agent to coordinate work.
 2. The foreground agent creates singleton sessions for independent tasks.
-3. The foreground agent uses `get_inbox` and `read_events` to fan in state.
+3. The foreground agent uses `get_inbox`, `read_events`, and
+   `get_latest_output` to fan in state and retrieve compact turn results.
 4. The foreground agent resolves permission/input requests.
 5. The foreground agent reports outcomes to the user.
 
@@ -230,6 +231,7 @@ Default tools:
 | `create_session` | Create a background session, optionally with an inline workspace spec. |
 | `send_message` | Start an asynchronous turn and return a `turn_id`. |
 | `read_events` | Read or long-poll sequence-numbered events for a resource. |
+| `get_latest_output` | Return the latest compact output/result for a completed, failed, or cancelled turn without requiring raw event inspection. |
 | `list_sessions` | List active/recent sessions for resuming coordination. |
 | `get_session` | Inspect one session, including workspace summary and cursors. |
 | `resolve_request` | Resolve permission, input, or other pending requests. |
@@ -239,7 +241,8 @@ Default tools:
 Tools intentionally collapsed out of the default surface:
 
 - `wait_for_event` is `read_events(wait_ms=...)`.
-- `read_output` is deferred until event payloads become too large.
+- `read_output` is covered by `get_latest_output` for compact latest turn
+  results; raw event replay remains `read_events`.
 - `list_pending_approvals` is covered by `get_inbox`.
 - separate approve/deny tools are `resolve_request(decision=...)`.
 - completion/read-state mutations are `ack_inbox`.

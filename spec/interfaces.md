@@ -429,7 +429,84 @@ Output:
 
 `wait_ms` replaces a separate wait tool.
 
-### 4.8 `list_sessions`
+### 4.8 `get_latest_output`
+
+Purpose: return the latest compact result for a session or a specific turn
+without requiring a foreground agent to inspect large raw event payloads.
+
+Input:
+
+```json
+{
+  "session_id": "sess_...",
+  "turn_id": "turn_..."
+}
+```
+
+`session_id` is required. `turn_id` is optional; when omitted, singleton selects
+the latest turn in that session whose status is `completed`, `failed`, or
+`cancelled`. If no such turn exists, the tool returns a typed empty result
+rather than an error.
+
+Output:
+
+```json
+{
+  "session_id": "sess_...",
+  "turn_id": "turn_...",
+  "turn_resource_uri": "singleton-turn:/turn_...",
+  "status": "completed",
+  "event_cursor": 48,
+  "source_event": {
+    "event_id": "evt_...",
+    "server_seq": 47,
+    "event_type": "assistant.message"
+  },
+  "result_text": "Added parser validation tests.",
+  "result_source": "assistant_message",
+  "needs_event_inspection": false,
+  "inspection_hint": null
+}
+```
+
+`result_source` values:
+
+- `assistant_message`: text was extracted from a known final assistant message
+  event shape, including Copilot-normalized `assistant.message.data.content`
+- `turn_summary`: text came from a singleton/backend terminal turn summary
+- `error_message`: text came from a known backend error event message
+- `none`: no concise result was found
+
+Rules:
+
+- The tool must not mutate inbox read state, session state, or event cursors.
+- It must not overload `read_events(cursor)` or introduce negative cursor
+  semantics.
+- When the extractor recognizes no concise text for an existing turn, it should
+  return `result_text: null`, `result_source: "none"`,
+  `needs_event_inspection: true`, and an `inspection_hint` pointing the
+  foreground agent to `read_events` with the returned `turn_resource_uri`.
+- For unknown Copilot SDK payload shapes, prefer `needs_event_inspection: true`
+  over guessing or synthesizing assistant text.
+
+No terminal turn output shape:
+
+```json
+{
+  "session_id": "sess_...",
+  "turn_id": null,
+  "turn_resource_uri": null,
+  "status": null,
+  "event_cursor": 44,
+  "source_event": null,
+  "result_text": null,
+  "result_source": "none",
+  "needs_event_inspection": false,
+  "inspection_hint": "no completed, failed, or cancelled turn exists for this session"
+}
+```
+
+### 4.9 `list_sessions`
 
 Purpose: recover coordination state after context loss.
 
@@ -464,7 +541,7 @@ Output:
 }
 ```
 
-### 4.9 `get_session`
+### 4.10 `get_session`
 
 Purpose: inspect one session.
 
@@ -498,7 +575,7 @@ Output:
 }
 ```
 
-### 4.10 `resolve_request`
+### 4.11 `resolve_request`
 
 Purpose: resolve permission, input, or elicitation requests.
 
@@ -536,7 +613,7 @@ Output:
 }
 ```
 
-### 4.11 `cancel_turn`
+### 4.12 `cancel_turn`
 
 Purpose: cancel a running turn.
 
@@ -563,7 +640,7 @@ Output:
 }
 ```
 
-### 4.12 `close_resource`
+### 4.13 `close_resource`
 
 Purpose: archive, dispose, or delete sessions and workspaces.
 
@@ -617,6 +694,8 @@ Required repository capabilities:
 - insert singleton intents before backend calls
 - append events with monotonically increasing `server_seq`
 - read events by resource and cursor
+- read recent turn events and latest terminal turns for compact result
+  extraction without changing cursor semantics
 - create and update hosts/workspaces/sessions/chats/turns/requests
 - resolve requests atomically
 - mark sessions degraded when backend resume fails

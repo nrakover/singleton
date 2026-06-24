@@ -7,12 +7,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use singleton_broker::{
     AckInboxReply, AckInboxRequest, Broker, CancelTurnReply, CancelTurnRequest, CloseResourceReply,
-    CloseResourceRequest, CreateSessionReply, CreateSessionRequest, ReadEventsReply,
-    ReadEventsRequest, ResolveRequest, SendMessageReply, SendMessageRequest, SessionDetail,
+    CloseResourceRequest, CreateSessionReply, CreateSessionRequest, GetLatestOutputRequest,
+    ReadEventsReply, ReadEventsRequest, ResolveRequest, SendMessageReply, SendMessageRequest,
+    SessionDetail,
 };
 use singleton_core::{
-    AgentBackend, Capabilities, HostConnector, Inbox, PendingRequest, Result as SingletonResult,
-    Session, SingletonError, Workspace, WorkspaceSpec,
+    AgentBackend, Capabilities, HostConnector, Inbox, LatestOutput, PendingRequest,
+    Result as SingletonResult, Session, SingletonError, Workspace, WorkspaceSpec,
 };
 
 #[tool_handler(router = self.tool_router)]
@@ -112,6 +113,14 @@ where
         Parameters(request): Parameters<ReadEventsRequest>,
     ) -> std::result::Result<Json<ReadEventsReply>, String> {
         mcp_json(self.broker.read_events(request).await)
+    }
+
+    #[tool(description = "Return the latest compact output/result for a session or turn.")]
+    pub async fn get_latest_output(
+        &self,
+        Parameters(request): Parameters<GetLatestOutputRequest>,
+    ) -> std::result::Result<Json<LatestOutput>, String> {
+        mcp_json(self.broker.get_latest_output(request))
     }
 
     #[tool(description = "List active and recent background sessions.")]
@@ -246,7 +255,7 @@ mod tests {
         assert_eq!(sent.status, ResourceStatus::Running);
         let Json(events) = server
             .read_events(Parameters(ReadEventsRequest {
-                session_id: Some(created.session_id),
+                session_id: Some(created.session_id.clone()),
                 resource_uri: None,
                 cursor: Some(0),
                 limit: Some(100),
@@ -261,6 +270,15 @@ mod tests {
                 .iter()
                 .any(|event| event.event_type == "turn.completed")
         );
+        let Json(output) = server
+            .get_latest_output(Parameters(GetLatestOutputRequest {
+                session_id: created.session_id,
+                turn_id: Some(sent.turn_id),
+            }))
+            .await
+            .map_err(SingletonError::InvalidInput)?;
+        assert_eq!(output.result_text.as_deref(), Some("fake turn completed"));
+        assert!(!output.needs_event_inspection);
         Ok(())
     }
 }

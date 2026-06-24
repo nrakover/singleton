@@ -31,6 +31,7 @@ pub const DEFAULT_MCP_TOOLS: &[&str] = &[
     "create_session",
     "send_message",
     "read_events",
+    "get_latest_output",
     "list_sessions",
     "get_session",
     "resolve_request",
@@ -324,6 +325,36 @@ pub struct Event {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LatestOutputSource {
+    AssistantMessage,
+    TurnSummary,
+    ErrorMessage,
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LatestOutputEventRef {
+    pub event_id: EventId,
+    pub server_seq: i64,
+    pub event_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LatestOutput {
+    pub session_id: SessionId,
+    pub turn_id: Option<TurnId>,
+    pub turn_resource_uri: Option<String>,
+    pub status: Option<ResourceStatus>,
+    pub event_cursor: i64,
+    pub source_event: Option<LatestOutputEventRef>,
+    pub result_text: Option<String>,
+    pub result_source: LatestOutputSource,
+    pub needs_event_inspection: bool,
+    pub inspection_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct BackendCapabilities {
     pub backend_id: BackendId,
     pub display_name: String,
@@ -562,9 +593,10 @@ mod tests {
 
     #[test]
     fn default_tool_profile_stays_small() {
-        assert_eq!(DEFAULT_MCP_TOOLS.len(), 12);
+        assert_eq!(DEFAULT_MCP_TOOLS.len(), 13);
         assert!(DEFAULT_MCP_TOOLS.contains(&"get_inbox"));
         assert!(DEFAULT_MCP_TOOLS.contains(&"ack_inbox"));
+        assert!(DEFAULT_MCP_TOOLS.contains(&"get_latest_output"));
         assert!(DEFAULT_MCP_TOOLS.contains(&"close_resource"));
     }
 }
