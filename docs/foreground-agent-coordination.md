@@ -5,6 +5,10 @@ the hub by convention: it uses singleton's MCP tools to create background
 sessions, dispatch turns, watch events, resolve requests, and clean up
 resources.
 
+The Copilot CLI plugin packages this cookbook as the `singleton` Skill in
+`.github/plugin/skills/singleton/SKILL.md` so installed foreground agents can
+load it directly.
+
 ## Coordinator prompt
 
 Use this as a system/developer-style instruction for an MCP-capable foreground

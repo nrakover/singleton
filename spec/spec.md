@@ -40,7 +40,8 @@ running until `singleton stop` or process termination.
 
 The primary Copilot CLI installation path is a Copilot plugin in this
 repository. Installing the plugin configures a `singleton` MCP server without
-requiring users to locate or edit Copilot's MCP JSON files:
+requiring users to locate or edit Copilot's MCP JSON files and installs a
+`singleton` Skill containing the foreground-agent coordination cookbook:
 
 ```bash
 copilot plugin marketplace add nrakover/singleton
@@ -54,6 +55,8 @@ The plugin launcher must:
 - use `${COPILOT_PLUGIN_DATA}` as persistent writable storage
 - install or reuse a released `singleton` binary for the current platform
 - exec `singleton serve --stdio --backend copilot`
+- declare the plugin-packaged `skills/` directory containing the `singleton`
+  foreground-agent Skill
 
 Supported launcher overrides include `SINGLETON_BINARY`,
 `SINGLETON_VERSION`, `SINGLETON_RELEASE_BASE_URL`,
@@ -75,6 +78,9 @@ singleton install-mcp --client codex
 A foreground agent is any MCP-capable agent currently interacting with the
 user. It discovers singleton's tools, creates background sessions, polls for
 events, resolves requests, and summarizes results.
+
+Copilot foreground agents can load the plugin-packaged `singleton` Skill for
+the recommended coordination cookbook.
 
 This is the new hub convention:
 

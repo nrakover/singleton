@@ -5,5 +5,6 @@
   "repository": "https://github.com/nrakover/singleton",
   "license": "MIT",
   "keywords": ["mcp", "agents", "sessions", "copilot"],
+  "skills": "skills",
   "mcpServers": "mcp.json"
 }
