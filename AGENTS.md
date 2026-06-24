@@ -48,6 +48,7 @@ Current:
 - `crates/singleton-mcp`
 - `crates/singleton-host`
 - `crates/singleton-cli`
+- `crates/singleton-broker`
 - `crates/singleton-test-support`
 
 ## Key Constraints
@@ -84,3 +85,15 @@ When changing behavior, update all relevant current artifacts:
 
 Do not recreate or extend the superseded Python hub/worker architecture unless
 the task is explicitly scoped as legacy archaeology.
+
+## Test Catalogue Discipline
+
+`spec/tests.md` is the PL-agnostic catalogue of hard invariants enforced by the
+executable test suite. Every entry must include preconditions, postconditions,
+and invariants, plus a status that distinguishes enforced coverage from planned
+or historical targets.
+
+When adding or changing executable tests, update `spec/tests.md` in the same
+change so the entry maps directly to formal assertions. If a spec entry has no
+corresponding executable test, mark it planned/unimplemented rather than
+implying it is enforced.
