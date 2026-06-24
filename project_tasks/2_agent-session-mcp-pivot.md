@@ -227,7 +227,7 @@ Packaging status:
 - A tag-driven GitHub Actions release workflow builds macOS Apple Silicon and
   Linux x86_64 release archives with matching SHA-256 files.
 - A Copilot CLI plugin manifest in the repository configures a `singleton` MCP
-  server.
+  server and packages a `singleton` foreground-agent Skill.
 - The plugin launcher installs/reuses a released binary in
   `${COPILOT_PLUGIN_DATA}` and then execs `singleton serve --stdio --backend
   copilot`.
@@ -238,7 +238,8 @@ Packaging status:
 - add examples for parallel research, isolated worktree tasks, inbox handling,
   approvals, cancellation, and cleanup
 
-Current artifact: `docs/foreground-agent-coordination.md`.
+Current artifacts: `docs/foreground-agent-coordination.md` and
+`.github/plugin/skills/singleton/SKILL.md`.
 
 ### Phase 4: remote/backend fast follow
 

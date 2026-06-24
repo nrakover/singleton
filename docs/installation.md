@@ -15,9 +15,11 @@ copilot plugin marketplace add nrakover/singleton
 copilot plugin install singleton@singleton
 ```
 
-The plugin contributes one MCP server named `singleton`. Its launcher keeps MCP
-stdout reserved for JSON-RPC, writes bootstrap diagnostics to stderr, installs a
-release binary into `${COPILOT_PLUGIN_DATA}/bin` when needed, then execs:
+The plugin contributes one MCP server named `singleton` and one Skill named
+`singleton` that teaches foreground agents the coordination loop. Its launcher
+keeps MCP stdout reserved for JSON-RPC, writes bootstrap diagnostics to stderr,
+installs a release binary into `${COPILOT_PLUGIN_DATA}/bin` when needed, then
+execs:
 
 ```bash
 singleton serve --stdio --backend copilot

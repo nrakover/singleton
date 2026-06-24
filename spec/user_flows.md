@@ -11,7 +11,8 @@ Copilot stores MCP configuration.
 
 1. User runs `copilot plugin marketplace add nrakover/singleton`.
 2. User runs `copilot plugin install singleton@singleton`.
-3. Copilot installs the plugin and loads its `singleton` MCP server definition.
+3. Copilot installs the plugin and loads its `singleton` MCP server definition
+   plus the `singleton` foreground-agent Skill.
 4. On first MCP server start, the plugin launcher resolves the platform.
 5. The launcher downloads the latest release archive and checksum into a
    temporary directory, verifies the checksum, and installs the binary into

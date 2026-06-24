@@ -176,6 +176,8 @@ Coverage:
 - release archives contain an executable `singleton` binary
 - Copilot marketplace manifest points at the plugin subdirectory
 - Copilot plugin manifest points to the MCP config file
+- Copilot plugin manifest points to the `skills` directory
+- plugin `skills/singleton/SKILL.md` exists with valid Skill frontmatter
 - plugin MCP config starts the launcher through `bash`
 - plugin launcher shell script passes syntax checks
 - plugin launcher writes bootstrap diagnostics to stderr, not stdout
@@ -259,9 +261,11 @@ These scenarios should run with fake backend and temporary local workspaces.
 3. Run `copilot plugin install singleton@singleton`.
 4. Start a new Copilot CLI session.
 5. Verify the `singleton` MCP tools are listed.
-6. Call `get_capabilities`, `create_session`, `send_message`, and
+6. Verify the plugin-packaged `singleton` Skill is available when the CLI exposes
+   skill inventory.
+7. Call `get_capabilities`, `create_session`, `send_message`, and
    `read_events`.
-7. Uninstall the local plugin.
+8. Uninstall the local plugin.
 
 ---
 

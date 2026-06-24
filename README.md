@@ -85,9 +85,10 @@ copilot plugin marketplace add nrakover/singleton
 copilot plugin install singleton@singleton
 ```
 
-The plugin contributes a `singleton` MCP server. Its launcher installs the
-latest GitHub release binary into Copilot's plugin data directory when needed,
-then runs `singleton serve --stdio --backend copilot`. See
+The plugin contributes a `singleton` MCP server and a `singleton` Skill with the
+foreground-agent coordination cookbook. Its launcher installs the latest GitHub
+release binary into Copilot's plugin data directory when needed, then runs
+`singleton serve --stdio --backend copilot`. See
 `docs/installation.md` for release assets, overrides, and non-Copilot clients.
 
 For direct MCP registration after installing or building a binary:
