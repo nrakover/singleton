@@ -25,15 +25,29 @@ Purpose: curated follow-up work for the Rust MCP session broker pivot.
 - Detach the auto-started daemon from the foreground MCP proxy process group so
   exiting Copilot CLI does not kill the daemon when the MCP child process tree is
   torn down.
+- Add an interprocess daemon startup lock around socket cleanup/bind/pid writes
+  so concurrent foreground MCP proxies cannot race while auto-starting the same
+  daemon.
 - Teach `singleton status` to report stale pid/socket files explicitly, and
   either clean them automatically or print the exact `singleton stop` cleanup
   command.
+- Document command semantics: `singleton start` and `singleton serve --stdio`
+  should be idempotent when the daemon is already running, while
+  `singleton serve --daemon` should fail clearly if another daemon owns the
+  state database.
 - Add a compact `get_latest_output` or summarized turn-result field so
   foreground agents do not need to inspect large raw SDK event payloads to find
   the final assistant answer.
+- Evaluate whether "latest output" should be a dedicated tool, a `get_session`
+  summary field, or a `read_events` tail mode. Avoid overloading ordinary
+  monotonic cursor semantics unless negative cursor behavior is explicitly
+  specified.
 - Add a cookbook prompt/config example showing the intended Copilot CLI flow:
   `get_capabilities`, `create_session`, `send_message`, `read_events`,
   result extraction, and `ack_inbox`.
+- Add namespace support for multi-foreground-agent scenarios: default to a
+  `default` namespace, allow foreground agents to specify a namespace on tools,
+  and scope session lists, inboxes, request resolution, and cleanup by namespace.
 - Decide whether inbox read state should be global or per-foreground-client
   before multi-operator workflows become common.
 
