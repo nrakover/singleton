@@ -65,6 +65,65 @@ Configure a foreground agent client after `singleton` is already installed.
 
 ---
 
+## 0.2 Configure Singleton Defaults
+
+### Goal
+
+Persist singleton preferences for default backend, model, mode, permissions,
+hosts, and repo/workspace placement without requiring every foreground agent to
+repeat those fields in MCP tool calls.
+
+### Flow
+
+1. User optionally creates
+   `${XDG_CONFIG_HOME:-$HOME/.config}/singleton/singleton.toml`.
+2. User optionally adds a repo-local `.singleton.toml`.
+3. Singleton resolves built-in defaults, user config, project config, env vars,
+   and CLI/MCP request fields into one effective config.
+4. `singleton serve --stdio` starts or reuses the daemon with that effective
+   config.
+5. Foreground agent calls `get_capabilities`.
+6. Singleton returns configured hosts/backends plus redacted effective defaults.
+7. Foreground agent calls `ensure_workspace` or `create_session`, omitting fields
+   that match the advertised defaults.
+
+### Expected behavior
+
+- If no config file exists, singleton behaves as if this default config existed:
+
+  ```toml
+  version = 1
+  default_profile = "default"
+
+  [profiles.default]
+  backend = "copilot"
+  mode = "interactive"
+  state_dir = "~/.singleton"
+  database = "~/.singleton/singleton.db"
+  default_host = "host_local"
+  repo_workspace_provider = "git_worktree"
+  cleanup_policy = "keep"
+
+  [profiles.default.permissions]
+  default = "ask"
+
+  [hosts.host_local]
+  kind = "local"
+  ```
+
+- Config file path defaults to `~/.config/singleton/singleton.toml` on
+  macOS/Linux.
+- Daemon state defaults to `~/.singleton`.
+- `mode` controls backend/agent behavior, while `permissions.default` controls
+  singleton-managed permission/input requests.
+- `repo_workspace_provider = "git_worktree"` applies only to repo-backed
+  workspace creation. Non-git directories fall back to `local_path`.
+- MCP tool definitions and runtime behavior use the same effective defaults.
+- Raw secrets are not stored in SQLite and should not be placed in singleton
+  config.
+
+---
+
 ## 1. Foreground Agent as Coordinator
 
 ### Goal
@@ -331,20 +390,36 @@ Run a session on another host while keeping the same MCP control surface.
 
 ### Flow
 
-1. Foreground agent calls `get_capabilities` and sees remote host support.
-2. Foreground agent calls `ensure_workspace` with a host id and repo/worktree
+1. User declares an SSH host in singleton config, for example:
+
+   ```toml
+   [hosts.devbox]
+   kind = "ssh"
+   target = "devbox"
+   connect_command = "singleton serve --stdio"
+   ```
+
+2. Foreground agent calls `get_capabilities` and sees remote host support.
+3. Foreground agent calls `ensure_workspace` with a host id and repo/worktree
    spec.
-3. Singleton connects to the host through a host connector.
-4. Host connector provisions the workspace.
-5. Foreground agent creates a session using that workspace.
-6. Events, requests, and changesets are normalized into singleton's store.
+4. Singleton connects to the host by running
+   `ssh devbox singleton serve --stdio` unless config overrides the remote
+   command.
+5. Remote singleton owns its own config/state paths and provisions the
+   workspace.
+6. Foreground agent creates a session using that workspace.
+7. Events, requests, and changesets are normalized into singleton's store.
 
 ### Expected behavior
 
 - The MCP tools do not change when host placement changes.
 - Host connectors advertise capabilities and limitations.
+- Normal SSH user, port, key, and proxy settings are delegated to the user's
+  central SSH config.
 - Secrets are referenced through host/provider config, not stored raw in
-  singleton's SQLite database.
+  singleton's SQLite database or copied into plaintext singleton config.
+- Local config does not contain remote singleton state paths; remote state is
+  owned by the remote singleton instance.
 
 ---
 

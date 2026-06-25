@@ -76,7 +76,9 @@ The plugin launcher must:
 
 Supported launcher overrides include `SINGLETON_BINARY`,
 `SINGLETON_VERSION`, `SINGLETON_RELEASE_BASE_URL`,
-`SINGLETON_FORCE_INSTALL`, `SINGLETON_BACKEND`, and `SINGLETON_DATABASE`.
+`SINGLETON_FORCE_INSTALL`, `SINGLETON_BACKEND`, `SINGLETON_DATABASE`,
+`SINGLETON_CONFIG`, `SINGLETON_PROFILE`, and
+`SINGLETON_NO_PROJECT_CONFIG`.
 
 Direct CLI registration remains available for Copilot CLI, Claude Code, Codex,
 and other stdio MCP clients:
@@ -88,6 +90,95 @@ singleton install-mcp --client codex
 ```
 
 `singleton mcp-config` remains the manual JSON escape hatch.
+
+### 2.1.2 Configuration
+
+Singleton has a typed persistent configuration story for user preferences and
+placement policy. Configuration is read at process startup and resolved into one
+effective config used by CLI commands, MCP tool definitions, broker defaults,
+backend selection, and host/workspace placement.
+
+The primary editable format is TOML. User config lives at
+`${XDG_CONFIG_HOME:-$HOME/.config}/singleton/singleton.toml` on macOS/Linux.
+Windows support may use `%APPDATA%\singleton\singleton.toml`. Project config is
+the nearest ancestor `.singleton.toml` from the invocation directory and is
+enabled by default; `--no-project-config` or
+`SINGLETON_NO_PROJECT_CONFIG=1` disables it. `--config PATH` or
+`SINGLETON_CONFIG=PATH` selects an explicit config file.
+
+Default runtime state remains under `~/.singleton`: the default database is
+`~/.singleton/singleton.db`, and pid/socket/log/artifact paths are derived from
+the selected state directory unless `--database` or `SINGLETON_DATABASE`
+overrides the database path.
+
+Precedence, from lowest to highest:
+
+1. built-in defaults
+2. user config
+3. project config
+4. environment variables
+5. CLI arguments and explicit MCP tool request fields
+
+When no config file exists, singleton behaves as if this config were present:
+
+```toml
+version = 1
+default_profile = "default"
+
+[profiles.default]
+backend = "copilot"
+mode = "interactive"
+state_dir = "~/.singleton"
+database = "~/.singleton/singleton.db"
+default_host = "host_local"
+repo_workspace_provider = "git_worktree"
+cleanup_policy = "keep"
+
+[profiles.default.permissions]
+default = "ask"
+
+[hosts.host_local]
+kind = "local"
+```
+
+`mode` and `permissions.default` are intentionally separate. `mode` is the
+backend/agent execution mode for a session or turn, such as `interactive` or
+`autopilot`. `permissions.default` is singleton's broker-side policy for
+permission/input requests emitted during execution, such as `ask`, `allow`, or
+`deny`. Backend adapters must map both values explicitly or reject unsupported
+combinations.
+
+`repo_workspace_provider = "git_worktree"` means that repo-backed shorthand
+workspace creation should prefer isolated git worktrees. Ordinary non-git
+directories fall back to `local_path`, and explicit MCP `WorkspaceSpec.kind`
+values always win.
+
+MCP tool definitions must be rendered from the same effective config used at
+runtime. If a configured default overlaps with a tool input, the default shown
+to the foreground agent must match the value the broker will apply. If the MCP
+schema implementation cannot render runtime defaults, singleton must omit
+misleading static defaults and expose redacted effective defaults through
+`get_capabilities`.
+
+Configured SSH hosts should delegate normal SSH details to the user's central
+SSH configuration. The minimal SSH host shape is:
+
+```toml
+[hosts.devbox]
+kind = "ssh"
+target = "devbox"
+connect_command = "singleton serve --stdio"
+ssh_args = ["-o", "BatchMode=yes"]
+```
+
+`target` is the exact SSH target or alias. `connect_command` defaults to
+`singleton serve --stdio` and describes how to connect to the remote singleton
+control surface over stdio. Local config must not contain remote singleton state
+paths such as `remote_state_dir`; remote state is owned by the remote singleton
+instance. Raw passwords, tokens, private-key contents, and decrypted credential
+material must not be stored in SQLite or encouraged in plaintext config. Store
+only safe references such as SSH aliases, `user@host` target strings, provider
+profile names, keychain item names, or environment variable names.
 
 ### 2.2 Foreground agent
 

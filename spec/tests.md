@@ -40,6 +40,47 @@ cargo test --workspace --features live-copilot -- --ignored
 
 ## 2. Enforced executable invariants by layer
 
+### 2.0 Config layer
+
+- **G1. Config defaults and precedence are deterministic**
+  - **Status**: Planned.
+  - **Executable anchors**: none.
+  - **Preconditions**: Load no config, user config, project config, environment
+    overrides, and CLI/MCP request overrides across supported path locations.
+  - **Postconditions**: No config is valid and synthesizes the default profile;
+    precedence is built-in defaults < user config < project config < env vars <
+    CLI args/MCP request fields; invalid versions, profile refs, host refs,
+    repo aliases, enum values, and path combinations fail explicitly.
+  - **Invariants**: Runtime defaults, advertised MCP defaults, CLI rendering,
+    backend selection, and host/workspace placement are all derived from the
+    same `EffectiveConfig` object.
+
+- **G2. Config remains safe to load from project files**
+  - **Status**: Planned.
+  - **Executable anchors**: none.
+  - **Preconditions**: Load nearest-ancestor `.singleton.toml` plus SSH host
+    declarations that use `kind`, `target`, optional `connect_command`, and
+    optional `ssh_args`.
+  - **Postconditions**: Project config cannot silently introduce arbitrary
+    non-default SSH `connect_command` values; raw passwords, tokens, and private
+    key contents are rejected or remain unrepresentable; redacted effective
+    config contains no secret-like values.
+  - **Invariants**: Project config is declarative and safe-by-schema; config-
+    driven host registration never persists raw secret material to SQLite.
+
+- **G3. Repo workspace provider fallback is source-sensitive**
+  - **Status**: Planned.
+  - **Executable anchors**: none.
+  - **Preconditions**: Resolve shorthand workspace defaults with
+    `repo_workspace_provider = "git_worktree"` for git repo sources and
+    ordinary non-git directories.
+  - **Postconditions**: Git repo sources default to isolated worktrees;
+    non-git directories fall back to `local_path`; explicit MCP
+    `WorkspaceSpec.kind` always wins.
+  - **Invariants**: Config defaults can fill omitted workspace placement fields
+    without overriding explicit tool input or treating arbitrary directories as
+    repositories.
+
 ### 2.1 Core model layer (`singleton-core`)
 
 - **C1. Stable resource URI syntax**
