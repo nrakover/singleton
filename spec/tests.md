@@ -58,6 +58,7 @@ cargo test --workspace --features live-copilot -- --ignored
     `invalid_repo_host_reference_is_rejected`, `local_host_rejects_ssh_fields`,
     `cli_mcp_config_uses_effective_config_and_explicit_overrides`,
     `mcp_database_arg_uses_resolved_database_when_home_is_missing`,
+    `capability_defaults_do_not_advertise_unavailable_host`,
     `install_mcp_preserves_config_selection_flags`,
     `stdio_mcp_serves_fake_backend_vertical_slice`.
   - **Preconditions**: Load no config, user config, project config, environment
@@ -67,8 +68,9 @@ cargo test --workspace --features live-copilot -- --ignored
     CLI args/MCP request fields; invalid versions, profile refs, host refs,
     repo aliases, enum values, and path combinations fail explicitly. Current
     executable coverage includes the config loader, CLI backend/database
-    rendering, and redacted capability defaults; broker fill for omitted MCP
-    request fields remains planned.
+    rendering, redacted capability defaults, and clamping advertised defaults to
+    currently advertised hosts; broker fill for omitted MCP request fields
+    remains planned.
   - **Invariants**: Runtime defaults, advertised MCP defaults, CLI rendering,
     backend selection, and host/workspace placement are all derived from the
     same `EffectiveConfig` object.

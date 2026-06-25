@@ -152,3 +152,5 @@ ssh_args = ["-o", "BatchMode=yes"]
 contents in singleton config; singleton state stores only safe references and
 metadata. Project config may use the default connect command, but cannot set or
 inherit non-default `connect_command` values or `ssh_args` for SSH hosts.
+SSH host descriptors are parsed for future support; they do not make remote
+workspace/session placement available yet.
