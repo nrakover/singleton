@@ -12,6 +12,32 @@ has a concrete host seam for it: `HostConnector` plus an SSH-specific
 - Preserve ordered event/reconnect assumptions so AHP can be added later.
 - Keep secrets out of SQLite; store only references such as SSH target names,
   provider ids, or keychain references.
+- Keep local config focused on how to connect to a remote singleton control
+  surface; remote singleton instances own their own state paths.
+
+## SSH host configuration
+
+The config story should keep SSH hosts minimal and delegate normal SSH behavior
+to the user's central SSH config:
+
+```toml
+[hosts.devbox]
+kind = "ssh"
+target = "devbox"
+connect_command = "singleton serve --stdio"
+ssh_args = ["-o", "BatchMode=yes"]
+```
+
+`target` is the exact SSH target or alias. `connect_command` defaults to
+`singleton serve --stdio` and is the remote command used to connect to the
+remote singleton control surface over stdio. If a future deployment needs to
+bridge to an existing remote daemon socket, that should be expressed by the
+remote command or wrapper rather than by adding remote socket/state paths to
+local config.
+
+Do not add `remote_state_dir` to local SSH host config. It leaks remote
+singleton internals and duplicates responsibility that belongs to the remote
+singleton instance.
 
 ## Host runner protocol
 
@@ -25,7 +51,7 @@ The fast-follow runner protocol should have these properties:
 5. Explicit workspace provider capabilities.
 6. Auth material referenced externally, never copied into singleton state.
 
-The current Rust scaffold starts with:
+The current Rust scaffold starts with a lower-level command runner:
 
 ```rust
 #[async_trait]
@@ -43,6 +69,11 @@ pub trait RemoteRunner: Send + Sync {
 `SshHostConnector<R>` accepts any runner, which keeps tests deterministic and
 lets future runners use native SSH libraries or cloud APIs.
 
+That scaffold can remain useful for tests and fallback workspace operations, but
+the preferred remote vertical slice should connect to a remote singleton stdio
+control surface with `ssh <target> <connect_command>`. That avoids requiring the
+local broker to know remote state paths or filesystem layout.
+
 ## SSH connector behavior
 
 `SshHostConnector` currently supports:
@@ -56,6 +87,11 @@ lets future runners use native SSH libraries or cloud APIs.
 The connector only constructs and dispatches remote workspace commands. It does
 not yet install `singletond`, start remote agent runtimes, stream remote events,
 or tunnel MCP. Those belong to the next remote vertical slice.
+
+With the config story in place, the next SSH slice should prefer a remote
+singleton stdio connector over adding more local-only remote workspace
+knowledge. Workspace provisioning should happen through the same MCP/broker
+contracts on the remote side whenever possible.
 
 ## Cloud sandbox candidates
 
@@ -101,13 +137,15 @@ Mapping:
 
 ## Next implementation slice
 
-1. Add a remote singleton bootstrap command that can install/start a remote
-   event forwarder over SSH.
-2. Persist SSH host configs with auth references.
-3. Add integration tests using a local fake SSH runner and, optionally, a real
+1. Add config-backed SSH host descriptors with `kind`, `target`, optional
+   `connect_command`, and optional `ssh_args`.
+2. Implement an SSH stdio connector that defaults to running
+   `ssh <target> singleton serve --stdio`.
+3. Add integration tests using a fake SSH runner and, optionally, a real
    localhost SSH target behind an ignored test.
-4. Add remote event ingestion into `singleton-store.events`.
-5. Decide whether remote sessions run a full `singletond` peer or a smaller
-   runner process.
-6. Prototype `AhpHostConnector` only after the SSH runner proves the
+4. Route remote workspace/session operations through the remote singleton
+   control surface and ingest ordered events into the local store.
+5. Keep the lower-level `RemoteRunner` workspace command path only as a fallback
+   or test utility unless product requirements prove it should be primary.
+6. Prototype `AhpHostConnector` only after the SSH stdio connector proves the
    host/workspace/session boundaries.

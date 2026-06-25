@@ -26,6 +26,16 @@ The `singleton` binary exposes these public commands:
 | `mcp-config` | Print a JSON MCP server snippet for manual client configuration. |
 | `install-mcp` | Register singleton with a supported MCP client using that client's native command. |
 
+Global configuration inputs:
+
+| Option/env | Default | Purpose |
+|---|---|---|
+| `--config PATH` / `SINGLETON_CONFIG` | `${XDG_CONFIG_HOME:-$HOME/.config}/singleton/singleton.toml` | Explicit singleton config file. |
+| `--profile NAME` / `SINGLETON_PROFILE` | config `default_profile`, then `default` | Select a named config profile. |
+| `--no-project-config` / `SINGLETON_NO_PROJECT_CONFIG=1` | false | Disable nearest-ancestor `.singleton.toml` loading. |
+| `--backend` / `SINGLETON_BACKEND` | effective profile backend, then `copilot` | Override selected backend. |
+| `--database` / `SINGLETON_DATABASE` | effective state dir database, then `~/.singleton/singleton.db` | Override SQLite database path. |
+
 `install-mcp` inputs:
 
 | Option | Values/default | Purpose |
@@ -166,7 +176,18 @@ Output:
 ```json
 {
   "protocol_version": "0.1",
-  "default_profile": "mvp",
+  "default_profile": "default",
+  "defaults": {
+    "backend": "copilot",
+    "model": null,
+    "mode": "interactive",
+    "permissions": {
+      "default": "ask"
+    },
+    "default_host": "host_local",
+    "repo_workspace_provider": "git_worktree",
+    "cleanup_policy": "keep"
+  },
   "hosts": [
     {
       "host_id": "host_local",
@@ -192,6 +213,12 @@ Output:
   }
 }
 ```
+
+`defaults` must be redacted and non-sensitive. It is the same effective default
+object used to render MCP tool schema defaults and to fill omitted tool input
+fields. If runtime MCP schema defaults cannot be generated safely, schemas must
+omit misleading static defaults rather than advertise values that differ from
+the effective config.
 
 ### 4.2 `get_inbox`
 
@@ -800,6 +827,23 @@ State path rules:
   `name.lock`
 - long socket paths are hashed into the system temp directory to satisfy Unix
   socket path limits
+
+Config path rules:
+
+- default user config on macOS/Linux:
+  `${XDG_CONFIG_HOME:-$HOME/.config}/singleton/singleton.toml`
+- optional project config: nearest ancestor `.singleton.toml`
+- explicit `--config PATH` or `SINGLETON_CONFIG=PATH` replaces user config path
+- `--no-project-config` or `SINGLETON_NO_PROJECT_CONFIG=1` disables project
+  config loading
+- no config file is valid; singleton synthesizes the built-in default profile,
+  local host, Copilot backend, interactive mode, ask permissions, git-worktree
+  repo workspace provider, and keep cleanup policy
+
+The CLI and MCP server must use the same resolved effective config. `mcp-config`
+and `install-mcp --dry-run` must render server arguments from that effective
+config, including explicit config/profile/database/backend overrides when they
+are selected.
 
 Optional later commands:
 

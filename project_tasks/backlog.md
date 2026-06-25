@@ -36,6 +36,24 @@ Completed P0 daemon lifecycle hardening:
 
 Remaining MCP and daemon usability follow-ups:
 
+- Add a typed singleton TOML config loader with default synthesis, redaction,
+  validation, and precedence tests:
+  - default user config path:
+    `${XDG_CONFIG_HOME:-$HOME/.config}/singleton/singleton.toml`
+  - optional nearest-ancestor project `.singleton.toml`
+  - default state dir remains `~/.singleton`
+  - no-config defaults synthesize Copilot backend, interactive mode,
+    `permissions.default = "ask"`, `default_host = "host_local"`,
+    `repo_workspace_provider = "git_worktree"`, and cleanup `keep`
+  - precedence: built-in defaults < user config < project config < env vars <
+    CLI args/MCP request fields
+  - SSH host config uses `kind`, `target`, optional `connect_command` defaulting
+    to `singleton serve --stdio`, and optional `ssh_args`; do not add local
+    `remote_state_dir` config.
+- Thread effective config through CLI commands, MCP capability/tool metadata,
+  broker defaults, backend selection, and host/workspace placement.
+- Ensure MCP tool schema defaults are rendered from the same effective config
+  used at runtime, or omitted until they can be truthful.
 - Extend `get_latest_output` extraction fixtures as more Copilot SDK event
   payload shapes are recorded; keep unknown shapes behind
   `needs_event_inspection` rather than guessing result text.

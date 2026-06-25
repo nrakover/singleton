@@ -35,6 +35,9 @@ Supported launcher overrides:
 | `SINGLETON_FORCE_INSTALL=1` | Reinstall the release binary even if one already exists. |
 | `SINGLETON_BACKEND` | Override the backend passed to `serve`; defaults to `copilot`. |
 | `SINGLETON_DATABASE` | Pass an explicit singleton SQLite database path. |
+| `SINGLETON_CONFIG` | Use an explicit singleton config file. |
+| `SINGLETON_PROFILE` | Select a named singleton config profile. |
+| `SINGLETON_NO_PROJECT_CONFIG=1` | Disable nearest-ancestor `.singleton.toml` loading. |
 
 The plugin currently supports macOS Apple Silicon and Linux x86_64 release
 archives. Other platforms should install from source and set `SINGLETON_BINARY`
@@ -85,3 +88,65 @@ codex mcp add singleton -- singleton serve --stdio --backend copilot
 
 `singleton mcp-config --backend copilot` prints a JSON snippet for clients that
 need manual MCP configuration.
+
+## Singleton configuration
+
+Singleton reads persistent preferences from TOML. On macOS/Linux the default
+user config path is:
+
+```text
+${XDG_CONFIG_HOME:-$HOME/.config}/singleton/singleton.toml
+```
+
+Project config is the nearest ancestor `.singleton.toml` from the invocation
+directory. Disable project config with `--no-project-config` or
+`SINGLETON_NO_PROJECT_CONFIG=1`. Override the user config path with
+`--config PATH` or `SINGLETON_CONFIG=PATH`, and select a profile with
+`--profile NAME` or `SINGLETON_PROFILE=NAME`.
+
+Daemon state defaults to `~/.singleton`; the default database is
+`~/.singleton/singleton.db`. `--database` and `SINGLETON_DATABASE` still provide
+explicit state isolation.
+
+If no config file exists, singleton behaves as if this config were present:
+
+```toml
+version = 1
+default_profile = "default"
+
+[profiles.default]
+backend = "copilot"
+mode = "interactive"
+state_dir = "~/.singleton"
+database = "~/.singleton/singleton.db"
+default_host = "host_local"
+repo_workspace_provider = "git_worktree"
+cleanup_policy = "keep"
+
+[profiles.default.permissions]
+default = "ask"
+
+[hosts.host_local]
+kind = "local"
+```
+
+`mode` controls the backend/agent execution mode. `permissions.default` controls
+singleton-managed permission/input request policy.
+`repo_workspace_provider = "git_worktree"` means repo-backed shorthand
+workspaces default to isolated git worktrees, while ordinary non-git
+directories fall back to `local_path`.
+
+SSH hosts delegate normal SSH details to your central SSH config:
+
+```toml
+[hosts.devbox]
+kind = "ssh"
+target = "devbox"
+connect_command = "singleton serve --stdio"
+ssh_args = ["-o", "BatchMode=yes"]
+```
+
+`target` is the exact SSH target or alias. `connect_command` defaults to
+`singleton serve --stdio`. Do not put raw passwords, tokens, or private-key
+contents in singleton config; singleton state stores only safe references and
+metadata.
