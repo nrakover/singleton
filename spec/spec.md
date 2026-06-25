@@ -402,9 +402,36 @@ but does not claim active-turn reattach.
 ### 6.2 Host connector
 
 Host placement is separate from agent backend choice. The MVP implements
-`LocalHostConnector`. Future connectors include:
+`LocalHostConnector`. Future SSH support should mean a named remote singleton
+endpoint reached over stdio:
 
-- SSH remote runner
+```text
+ssh [ssh_args...] target connect_command
+```
+
+SSH host config v1 is minimal:
+
+- `kind = "ssh"`
+- `target`: exact SSH target or alias; user, port, key, and proxy settings are
+  delegated to `~/.ssh/config`
+- optional `connect_command`, defaulting to `singleton serve --stdio`
+- optional `ssh_args`, passed as local `ssh` argv items
+
+Project-sourced SSH config must not silently introduce arbitrary commands:
+non-default `connect_command` values and free-form `ssh_args` require
+trusted-user configuration metadata and must not be inherited by a
+project-touched host id. Singleton must not store raw passwords, tokens, private
+key contents, remote daemon state directories, or remote socket paths in config
+or SQLite.
+
+The accepted SSH config shape is a descriptor, not a claim that SSH runtime
+support is available. Until SSH handshake, federation, event mirroring, and
+forwarded mutation semantics exist, configured SSH hosts must be reported as
+unsupported or unavailable rather than advertising workspace providers/backends.
+
+Future connectors include:
+
+- SSH remote singleton connector
 - cloud sandbox provider
 - AHP host connector
 

@@ -18,6 +18,7 @@ path = "src/main.rs"
 clap.workspace = true
 fs2.workspace = true
 singleton-broker = { path = "../singleton-broker" }
+singleton-config = { path = "../singleton-config" }
 singleton-copilot = { path = "../singleton-copilot" }
 singleton-core = { path = "../singleton-core" }
 singleton-host = { path = "../singleton-host" }

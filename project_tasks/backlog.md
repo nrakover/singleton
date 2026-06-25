@@ -34,26 +34,22 @@ Completed P0 daemon lifecycle hardening:
   is already running; `singleton serve --daemon` fails clearly if another daemon
   owns the state database.
 
+Completed first config execution slice:
+
+- Added a typed singleton TOML config loader with default synthesis, redaction,
+  validation, and precedence tests for user/project/explicit config, env vars,
+  CLI backend/database overrides, `host_local`, SSH connect-command safety, and
+  repo-source provider fallback.
+- Threaded effective backend/database/profile/default metadata through CLI
+  daemon commands, generated MCP registrations, broker capability defaults, and
+  backend selection.
+
 Remaining MCP and daemon usability follow-ups:
 
-- Add a typed singleton TOML config loader with default synthesis, redaction,
-  validation, and precedence tests:
-  - default user config path:
-    `${XDG_CONFIG_HOME:-$HOME/.config}/singleton/singleton.toml`
-  - optional nearest-ancestor project `.singleton.toml`
-  - default state dir remains `~/.singleton`
-  - no-config defaults synthesize Copilot backend, interactive mode,
-    `permissions.default = "ask"`, `default_host = "host_local"`,
-    `repo_workspace_provider = "git_worktree"`, and cleanup `keep`
-  - precedence: built-in defaults < user config < project config < env vars <
-    CLI args/MCP request fields
-  - SSH host config uses `kind`, `target`, optional `connect_command` defaulting
-    to `singleton serve --stdio`, and optional `ssh_args`; do not add local
-    `remote_state_dir` config.
-- Thread effective config through CLI commands, MCP capability/tool metadata,
-  broker defaults, backend selection, and host/workspace placement.
-- Ensure MCP tool schema defaults are rendered from the same effective config
-  used at runtime, or omitted until they can be truthful.
+- Fill broker/MCP request defaults from `EffectiveConfig`: default host, mode,
+  permissions, cleanup policy, and repo workspace provider.
+- Render MCP tool schema defaults from the same effective config when the schema
+  layer can do so truthfully; omit misleading static defaults until then.
 - Extend `get_latest_output` extraction fixtures as more Copilot SDK event
   payload shapes are recorded; keep unknown shapes behind
   `needs_event_inspection` rather than guessing result text.
@@ -85,8 +81,17 @@ Remaining MCP and daemon usability follow-ups:
 
 ## Remote hosts
 
-- Extend the initial `RemoteRunner`/`SshHostConnector` scaffold into a full
-  remote session runner with reconnect/replay semantics.
+- Correct SSH docs/specs so accepted host descriptors are not confused with
+  runtime support; SSH v1 should be a remote singleton stdio connector, not
+  local ad hoc remote shell/git commands.
+- Keep SSH host descriptors inert until runtime support exists: project config
+  cannot define executable SSH details or cause remote session placement by
+  default.
+- Add capability/UX gating for configured-but-unsupported SSH hosts before any
+  connector advertises workspace providers or backends.
+- Later implement SSH stdio handshake, local/remote id mapping, mirrored event
+  replay, idempotent forwarded mutations, remote request/cancel/cleanup acks,
+  and fake remote MCP tests before user-visible SSH support.
 - Evaluate cloud sandbox providers such as GitHub-hosted sessions or Daytona.
 - Support repo-homed workspaces on remote hosts.
 
