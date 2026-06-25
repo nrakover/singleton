@@ -418,8 +418,17 @@ Run a session on another host while keeping the same MCP control surface.
   central SSH config.
 - Secrets are referenced through host/provider config, not stored raw in
   singleton's SQLite database or copied into plaintext singleton config.
+- SSH `target` is passed as the exact target/alias; user, port, identity, and
+  proxy details live in `~/.ssh/config`.
+- Singleton config does not store remote daemon state directories or socket
+  paths.
+- Project-scoped config cannot silently introduce a non-default remote
+  `connect_command` or free-form local `ssh_args`, including by inheriting those
+  fields from trusted user config for a project-touched host id.
 - Local config does not contain remote singleton state paths; remote state is
   owned by the remote singleton instance.
+- This is a future flow: until federation is implemented, configured SSH hosts
+  must not be advertised as usable for workspace/session placement.
 
 ---
 

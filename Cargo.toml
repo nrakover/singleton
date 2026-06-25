@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/singleton-core",
+    "crates/singleton-config",
     "crates/singleton-store",
     "crates/singleton-host",
     "crates/singleton-test-support",
@@ -33,6 +34,7 @@ thiserror = "2.0.18"
 time = { version = "0.3.44", features = ["formatting"] }
 tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-stream = "0.1.17"
+toml = "0.8.23"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 uuid = { version = "1.19.0", features = ["serde", "v7"] }

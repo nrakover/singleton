@@ -11,6 +11,10 @@ use fs2::FileExt;
 use rmcp::ServiceExt;
 use serde_json::json;
 use singleton_broker::Broker;
+use singleton_config::{
+    ConfigEnvironment, ConfigFieldOverrides, ConfigLoadOptions, EffectiveConfig,
+    default_database_path, load_effective_config,
+};
 use singleton_copilot::CopilotBackend;
 use singleton_core::{AgentBackend, Result, SingletonError};
 use singleton_host::LocalHostConnector;
@@ -26,6 +30,12 @@ const DAEMON_STARTUP_LOCK_HELD_ENV: &str = "SINGLETON_DAEMON_STARTUP_LOCK_HELD";
 #[command(name = "singleton")]
 #[command(about = "Durable MCP broker for background agent sessions")]
 struct Cli {
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+    #[arg(long, global = true)]
+    profile: Option<String>,
+    #[arg(long, global = true)]
+    no_project_config: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -35,8 +45,8 @@ enum Command {
     Serve {
         #[arg(long)]
         database: Option<PathBuf>,
-        #[arg(long, value_enum, default_value = "fake")]
-        backend: BackendKind,
+        #[arg(long, value_enum)]
+        backend: Option<BackendKind>,
         #[arg(long)]
         once: bool,
         #[arg(long)]
@@ -49,8 +59,8 @@ enum Command {
     Start {
         #[arg(long)]
         database: Option<PathBuf>,
-        #[arg(long, value_enum, default_value = "copilot")]
-        backend: BackendKind,
+        #[arg(long, value_enum)]
+        backend: Option<BackendKind>,
     },
     Status {
         #[arg(long)]
@@ -61,8 +71,8 @@ enum Command {
         database: Option<PathBuf>,
     },
     McpConfig {
-        #[arg(long, value_enum, default_value = "copilot")]
-        backend: BackendKind,
+        #[arg(long, value_enum)]
+        backend: Option<BackendKind>,
         #[arg(long)]
         database: Option<PathBuf>,
     },
@@ -71,8 +81,8 @@ enum Command {
         client: McpClientKind,
         #[arg(long, default_value = "singleton")]
         name: String,
-        #[arg(long, value_enum, default_value = "copilot")]
-        backend: BackendKind,
+        #[arg(long, value_enum)]
+        backend: Option<BackendKind>,
         #[arg(long)]
         database: Option<PathBuf>,
         #[arg(long)]
@@ -93,6 +103,20 @@ impl BackendKind {
         match self {
             Self::Fake => "fake",
             Self::Copilot => "copilot",
+        }
+    }
+}
+
+impl TryFrom<&str> for BackendKind {
+    type Error = SingletonError;
+
+    fn try_from(value: &str) -> Result<Self> {
+        match value {
+            "fake" => Ok(Self::Fake),
+            "copilot" => Ok(Self::Copilot),
+            other => Err(SingletonError::InvalidInput(format!(
+                "unsupported backend '{other}'"
+            ))),
         }
     }
 }
@@ -124,6 +148,13 @@ struct StatePaths {
 
 struct DaemonStartupLock {
     file: File,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ConfigArgs {
+    config: Option<PathBuf>,
+    profile: Option<String>,
+    no_project_config: bool,
 }
 
 impl DaemonStartupLock {
@@ -264,6 +295,11 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
     let cli = Cli::parse();
+    let config_args = ConfigArgs {
+        config: cli.config,
+        profile: cli.profile,
+        no_project_config: cli.no_project_config,
+    };
     match cli.command {
         Command::Serve {
             database,
@@ -272,11 +308,11 @@ async fn main() -> Result<()> {
             stdio,
             daemon,
             direct,
-        } => serve(database, backend, once, stdio, daemon, direct).await,
-        Command::Start { database, backend } => start(database, backend).await,
-        Command::Status { database } => status(database).await,
-        Command::Stop { database } => stop(database).await,
-        Command::McpConfig { backend, database } => mcp_config(backend, database),
+        } => serve(&config_args, database, backend, once, stdio, daemon, direct).await,
+        Command::Start { database, backend } => start(&config_args, database, backend).await,
+        Command::Status { database } => status(&config_args, database).await,
+        Command::Stop { database } => stop(&config_args, database).await,
+        Command::McpConfig { backend, database } => mcp_config(&config_args, backend, database),
         Command::InstallMcp {
             client,
             name,
@@ -284,24 +320,35 @@ async fn main() -> Result<()> {
             database,
             binary,
             dry_run,
-        } => install_mcp(client, &name, backend, database, binary, dry_run),
+        } => install_mcp(
+            &config_args,
+            client,
+            &name,
+            backend,
+            database,
+            binary,
+            dry_run,
+        ),
     }
 }
 
 async fn serve(
+    config_args: &ConfigArgs,
     database: Option<PathBuf>,
-    backend: BackendKind,
+    backend: Option<BackendKind>,
     once: bool,
     stdio: bool,
     daemon: bool,
     direct: bool,
 ) -> Result<()> {
-    let paths = resolve_state_paths(database)?;
+    let effective = resolve_effective_config(config_args, database, backend)?;
+    let backend = BackendKind::try_from(effective.backend.as_str())?;
+    let paths = resolve_state_paths(effective.database.clone())?;
     if stdio && !direct && !daemon && !once {
-        return proxy_stdio_to_daemon(paths, backend).await;
+        return proxy_stdio_to_daemon(paths, backend, config_args).await;
     }
     if daemon {
-        return run_backend(paths.database.clone(), backend, ServeMode::Daemon(paths)).await;
+        return run_backend(effective, backend, ServeMode::Daemon(paths)).await;
     }
     let mode = if stdio {
         ServeMode::DirectStdio
@@ -310,12 +357,18 @@ async fn serve(
     } else {
         ServeMode::Foreground
     };
-    run_backend(paths.database, backend, mode).await
+    run_backend(effective, backend, mode).await
 }
 
-async fn start(database: Option<PathBuf>, backend: BackendKind) -> Result<()> {
-    let paths = resolve_state_paths(database)?;
-    ensure_daemon_running(&paths, backend).await?;
+async fn start(
+    config_args: &ConfigArgs,
+    database: Option<PathBuf>,
+    backend: Option<BackendKind>,
+) -> Result<()> {
+    let effective = resolve_effective_config(config_args, database, backend)?;
+    let backend = BackendKind::try_from(effective.backend.as_str())?;
+    let paths = resolve_state_paths(effective.database)?;
+    ensure_daemon_running(&paths, backend, config_args).await?;
     let daemon = inspect_daemon(&paths).await?;
     let pid = match daemon.pid {
         PidFileState::Alive(pid) => pid.to_string(),
@@ -331,8 +384,9 @@ async fn start(database: Option<PathBuf>, backend: BackendKind) -> Result<()> {
     Ok(())
 }
 
-async fn status(database: Option<PathBuf>) -> Result<()> {
-    let paths = resolve_state_paths(database)?;
+async fn status(config_args: &ConfigArgs, database: Option<PathBuf>) -> Result<()> {
+    let effective = resolve_effective_config(config_args, database, None)?;
+    let paths = resolve_state_paths(effective.database)?;
     let daemon = inspect_daemon(&paths).await?;
     println!("daemon: {}", daemon.state.label());
     println!("database: {}", paths.database.display());
@@ -360,8 +414,9 @@ async fn status(database: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-async fn stop(database: Option<PathBuf>) -> Result<()> {
-    let paths = resolve_state_paths(database)?;
+async fn stop(config_args: &ConfigArgs, database: Option<PathBuf>) -> Result<()> {
+    let effective = resolve_effective_config(config_args, database, None)?;
+    let paths = resolve_state_paths(effective.database)?;
     let daemon = inspect_daemon(&paths).await?;
     if let Some(pid) = daemon.pid.alive_pid() {
         signal_process(pid, "TERM")?;
@@ -386,9 +441,17 @@ async fn stop(database: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn mcp_config(backend: BackendKind, database: Option<PathBuf>) -> Result<()> {
+fn mcp_config(
+    config_args: &ConfigArgs,
+    backend: Option<BackendKind>,
+    database: Option<PathBuf>,
+) -> Result<()> {
+    let explicit_database = database.is_some();
+    let effective = resolve_effective_config(config_args, database, backend)?;
+    let backend = BackendKind::try_from(effective.backend.as_str())?;
+    let database = database_arg_for_server(&effective, explicit_database)?;
     let executable = resolve_singleton_binary(None)?;
-    let args = singleton_server_args(backend, database);
+    let args = singleton_server_args(config_args, backend, database);
     let config = json!({
         "mcpServers": {
             "singleton": {
@@ -404,14 +467,19 @@ fn mcp_config(backend: BackendKind, database: Option<PathBuf>) -> Result<()> {
 }
 
 fn install_mcp(
+    config_args: &ConfigArgs,
     client: McpClientKind,
     name: &str,
-    backend: BackendKind,
+    backend: Option<BackendKind>,
     database: Option<PathBuf>,
     binary: Option<PathBuf>,
     dry_run: bool,
 ) -> Result<()> {
-    let command = install_mcp_command(client, name, backend, database, binary)?;
+    let explicit_database = database.is_some();
+    let effective = resolve_effective_config(config_args, database, backend)?;
+    let backend = BackendKind::try_from(effective.backend.as_str())?;
+    let database = database_arg_for_server(&effective, explicit_database)?;
+    let command = install_mcp_command(client, name, config_args, backend, database, binary)?;
     if dry_run {
         println!("{}", command.render_shell());
         return Ok(());
@@ -438,6 +506,55 @@ fn install_mcp(
     Ok(())
 }
 
+fn resolve_effective_config(
+    args: &ConfigArgs,
+    database: Option<PathBuf>,
+    backend: Option<BackendKind>,
+) -> Result<EffectiveConfig> {
+    let env = ConfigEnvironment::from_process();
+    let cwd = std::env::current_dir().map_err(|error| {
+        SingletonError::InvalidState(format!("read current directory: {error}"))
+    })?;
+    let mut options = ConfigLoadOptions::new(cwd, env);
+    options.config_path = args.config.clone();
+    options.profile = args.profile.clone();
+    options.no_project_config = args.no_project_config;
+    let mut overrides = ConfigFieldOverrides::default();
+    if let Some(database) = database {
+        overrides.database = Some(database);
+    }
+    if let Some(backend) = backend {
+        overrides.backend = Some(backend.as_str().to_string());
+    }
+    options.cli_overrides = overrides;
+    load_effective_config(options)
+}
+
+fn database_arg_for_server(
+    effective: &EffectiveConfig,
+    explicit_database: bool,
+) -> Result<Option<PathBuf>> {
+    let env = ConfigEnvironment::from_process();
+    database_arg_for_server_with_env(effective, explicit_database, &env)
+}
+
+fn database_arg_for_server_with_env(
+    effective: &EffectiveConfig,
+    explicit_database: bool,
+    env: &ConfigEnvironment,
+) -> Result<Option<PathBuf>> {
+    let default_database = default_database_path(env);
+    if explicit_database
+        || default_database
+            .as_ref()
+            .map_or(true, |default| effective.database != *default)
+    {
+        Ok(Some(effective.database.clone()))
+    } else {
+        Ok(None)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommandSpec {
     program: String,
@@ -457,13 +574,14 @@ impl CommandSpec {
 fn install_mcp_command(
     client: McpClientKind,
     name: &str,
+    config_args: &ConfigArgs,
     backend: BackendKind,
     database: Option<PathBuf>,
     binary: Option<PathBuf>,
 ) -> Result<CommandSpec> {
     let binary = resolve_singleton_binary(binary)?;
     let mut server_args = vec![binary];
-    server_args.extend(singleton_server_args(backend, database));
+    server_args.extend(singleton_server_args(config_args, backend, database));
     let mut args = match client {
         McpClientKind::Copilot => vec!["mcp".into(), "add".into(), name.into(), "--".into()],
         McpClientKind::Claude => vec![
@@ -493,18 +611,37 @@ fn resolve_singleton_binary(binary: Option<PathBuf>) -> Result<String> {
     Ok(binary.to_string_lossy().to_string())
 }
 
-fn singleton_server_args(backend: BackendKind, database: Option<PathBuf>) -> Vec<String> {
+fn singleton_server_args(
+    config_args: &ConfigArgs,
+    backend: BackendKind,
+    database: Option<PathBuf>,
+) -> Vec<String> {
     let mut args = vec![
         "serve".to_string(),
         "--stdio".to_string(),
         "--backend".to_string(),
         backend.as_str().to_string(),
     ];
+    append_config_flags(&mut args, config_args);
     if let Some(database) = database {
         args.push("--database".to_string());
         args.push(database.to_string_lossy().to_string());
     }
     args
+}
+
+fn append_config_flags(args: &mut Vec<String>, config_args: &ConfigArgs) {
+    if let Some(config) = &config_args.config {
+        args.push("--config".to_string());
+        args.push(config.to_string_lossy().to_string());
+    }
+    if let Some(profile) = &config_args.profile {
+        args.push("--profile".to_string());
+        args.push(profile.clone());
+    }
+    if config_args.no_project_config {
+        args.push("--no-project-config".to_string());
+    }
 }
 
 fn shell_quote(value: &str) -> String {
@@ -531,12 +668,19 @@ fn shell_quote(value: &str) -> String {
     }
 }
 
-async fn run_backend(database: PathBuf, backend: BackendKind, mode: ServeMode) -> Result<()> {
-    let store = Store::open(database)?;
+async fn run_backend(
+    effective: EffectiveConfig,
+    backend: BackendKind,
+    mode: ServeMode,
+) -> Result<()> {
+    let store = Store::open(&effective.database)?;
+    let default_profile = effective.profile.clone();
+    let capability_defaults = effective.capability_defaults();
     match backend {
         BackendKind::Fake => {
-            let broker =
-                Broker::new_with_reconnect(store, FakeBackend::new(), LocalHostConnector).await?;
+            let broker = Broker::new_with_reconnect(store, FakeBackend::new(), LocalHostConnector)
+                .await?
+                .with_capability_defaults(default_profile, capability_defaults);
             run_broker(broker, mode).await
         }
         BackendKind::Copilot => {
@@ -544,7 +688,9 @@ async fn run_backend(database: PathBuf, backend: BackendKind, mode: ServeMode) -
                 SingletonError::InvalidState(format!("read current directory: {error}"))
             })?;
             let backend = CopilotBackend::new(cwd).with_request_store(store.clone());
-            let broker = Broker::new_with_reconnect(store, backend, LocalHostConnector).await?;
+            let broker = Broker::new_with_reconnect(store, backend, LocalHostConnector)
+                .await?
+                .with_capability_defaults(default_profile, capability_defaults);
             run_broker(broker, mode).await
         }
     }
@@ -642,8 +788,12 @@ async fn bind_daemon_listener(paths: &StatePaths) -> Result<UnixListener> {
     Ok(listener)
 }
 
-async fn proxy_stdio_to_daemon(paths: StatePaths, backend: BackendKind) -> Result<()> {
-    ensure_daemon_running(&paths, backend).await?;
+async fn proxy_stdio_to_daemon(
+    paths: StatePaths,
+    backend: BackendKind,
+    config_args: &ConfigArgs,
+) -> Result<()> {
+    ensure_daemon_running(&paths, backend, config_args).await?;
     let stream = UnixStream::connect(&paths.socket).await.map_err(|error| {
         SingletonError::InvalidState(format!("connect {}: {error}", paths.socket.display()))
     })?;
@@ -663,7 +813,11 @@ async fn proxy_stdio_to_daemon(paths: StatePaths, backend: BackendKind) -> Resul
     Ok(())
 }
 
-async fn ensure_daemon_running(paths: &StatePaths, backend: BackendKind) -> Result<()> {
+async fn ensure_daemon_running(
+    paths: &StatePaths,
+    backend: BackendKind,
+    config_args: &ConfigArgs,
+) -> Result<()> {
     if daemon_socket_ready(paths).await {
         return Ok(());
     }
@@ -675,16 +829,19 @@ async fn ensure_daemon_running(paths: &StatePaths, backend: BackendKind) -> Resu
         SingletonError::InvalidState(format!("locate singleton binary: {error}"))
     })?;
     let database_arg = paths.database.to_string_lossy().to_string();
+    let mut args = Vec::new();
+    append_config_flags(&mut args, config_args);
+    args.extend([
+        "serve".to_string(),
+        "--daemon".to_string(),
+        "--backend".to_string(),
+        backend.as_str().to_string(),
+        "--database".to_string(),
+        database_arg,
+    ]);
     let mut command = ProcessCommand::new(executable);
     command
-        .args([
-            "serve",
-            "--daemon",
-            "--backend",
-            backend.as_str(),
-            "--database",
-            &database_arg,
-        ])
+        .args(args)
         .env(DAEMON_STARTUP_LOCK_HELD_ENV, &paths.lock)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -832,8 +989,7 @@ fn remove_stale_socket(paths: &StatePaths) -> Result<()> {
     Ok(())
 }
 
-fn resolve_state_paths(database: Option<PathBuf>) -> Result<StatePaths> {
-    let database = resolve_database(database)?;
+fn resolve_state_paths(database: PathBuf) -> Result<StatePaths> {
     let directory = database
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -866,26 +1022,17 @@ fn resolve_state_paths(database: Option<PathBuf>) -> Result<StatePaths> {
     })
 }
 
+#[cfg(test)]
 fn resolve_database(database: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(database) = database {
         return Ok(database);
     }
-    let home = std::env::var_os("HOME").ok_or_else(|| {
-        SingletonError::InvalidInput("HOME is not set; pass --database explicitly".to_string())
-    })?;
-    let dir = PathBuf::from(home).join(".singleton");
-    fs::create_dir_all(&dir).map_err(|error| {
-        SingletonError::Store(format!(
-            "create singleton state directory {}: {error}",
-            dir.display()
-        ))
-    })?;
-    Ok(dir.join("singleton.db"))
+    default_database_path(&ConfigEnvironment::from_process())
 }
 
 #[cfg(test)]
 mod tests {
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
 
     use super::*;
 
@@ -902,7 +1049,7 @@ mod tests {
     fn explicit_database_derives_pid_and_socket_paths() -> Result<()> {
         let file = NamedTempFile::new()
             .map_err(|error| SingletonError::Store(format!("create temp db: {error}")))?;
-        let paths = resolve_state_paths(Some(file.path().to_path_buf()))?;
+        let paths = resolve_state_paths(file.path().to_path_buf())?;
         assert_eq!(paths.database, file.path());
         assert_eq!(
             paths.pid.extension().and_then(|value| value.to_str()),
@@ -916,10 +1063,31 @@ mod tests {
     }
 
     #[test]
+    fn mcp_database_arg_uses_resolved_database_when_home_is_missing() -> Result<()> {
+        let temp = TempDir::new()
+            .map_err(|error| SingletonError::Store(format!("create temp dir: {error}")))?;
+        let database = temp.path().join("configured.db");
+        let mut options = ConfigLoadOptions::new(temp.path(), ConfigEnvironment::new(None, None));
+        options.cli_overrides = ConfigFieldOverrides::default().with_database(database.clone());
+        let effective = load_effective_config(options)?;
+
+        assert_eq!(
+            database_arg_for_server_with_env(
+                &effective,
+                false,
+                &ConfigEnvironment::new(None, None)
+            )?,
+            Some(database)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn install_mcp_builds_copilot_command() -> Result<()> {
         let command = install_mcp_command(
             McpClientKind::Copilot,
             "singleton",
+            &ConfigArgs::default(),
             BackendKind::Copilot,
             None,
             Some(PathBuf::from("/usr/local/bin/singleton")),
@@ -947,6 +1115,7 @@ mod tests {
         let command = install_mcp_command(
             McpClientKind::Claude,
             "singleton-dev",
+            &ConfigArgs::default(),
             BackendKind::Fake,
             Some(PathBuf::from("/tmp/singleton.db")),
             Some(PathBuf::from("/opt/singleton/bin/singleton")),
@@ -978,6 +1147,7 @@ mod tests {
         let command = install_mcp_command(
             McpClientKind::Codex,
             "singleton",
+            &ConfigArgs::default(),
             BackendKind::Copilot,
             None,
             Some(PathBuf::from("singleton")),
@@ -995,6 +1165,43 @@ mod tests {
                 "--stdio",
                 "--backend",
                 "copilot"
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn install_mcp_preserves_config_selection_flags() -> Result<()> {
+        let config_args = ConfigArgs {
+            config: Some(PathBuf::from("/tmp/singleton.toml")),
+            profile: Some("work".to_string()),
+            no_project_config: true,
+        };
+        let command = install_mcp_command(
+            McpClientKind::Copilot,
+            "singleton",
+            &config_args,
+            BackendKind::Copilot,
+            None,
+            Some(PathBuf::from("singleton")),
+        )?;
+        assert_eq!(
+            command.args,
+            strings(&[
+                "mcp",
+                "add",
+                "singleton",
+                "--",
+                "singleton",
+                "serve",
+                "--stdio",
+                "--backend",
+                "copilot",
+                "--config",
+                "/tmp/singleton.toml",
+                "--profile",
+                "work",
+                "--no-project-config"
             ])
         );
         Ok(())
