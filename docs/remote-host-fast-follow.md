@@ -1,8 +1,9 @@
 # Remote Host Fast Follow
 
-Remote execution is outside the MVP runtime path, but the Rust workspace now
-has a concrete host seam for it: `HostConnector` plus an SSH-specific
-`RemoteRunner` abstraction in `singleton-host`.
+Remote execution is outside the default MVP runtime path, but the Rust
+workspace now has a concrete host seam for it: `HostConnector`, an SSH-specific
+`RemoteRunner` for one-shot remote workspace commands, and an SSH control
+surface connector for running a remote singleton MCP server over stdio.
 
 ## Goals
 
@@ -66,8 +67,45 @@ pub trait RemoteRunner: Send + Sync {
 ```
 
 `SshRemoteRunner` implements that trait with the local `ssh` binary.
-`SshHostConnector<R>` accepts any runner, which keeps tests deterministic and
-lets future runners use native SSH libraries or cloud APIs.
+`SshHostConnector<R, T>` accepts any command runner and stdio process transport,
+which keeps tests deterministic and lets future runners use native SSH
+libraries or cloud APIs.
+
+The first SSH control-surface slice adds an injectable stdio process transport.
+It builds this exact local argv shape:
+
+```text
+ssh [ssh_args...] target connect_command
+```
+
+No local shell parses `target`, `ssh_args`, or `connect_command`; each element is
+passed as an argv item to the `ssh` process. The remote SSH server still runs the
+final `connect_command` according to SSH semantics, so non-default commands are
+trusted-user configuration only.
+
+## SSH host config v1
+
+Minimal SSH host config is intentionally small:
+
+| Field | Required | Meaning |
+|---|---:|---|
+| `kind = "ssh"` | yes | Selects the SSH host connector. |
+| `target` | yes | Exact SSH target or alias. User, port, key, and proxy settings belong in `~/.ssh/config`. |
+| `connect_command` | no | Remote command to run; defaults to `singleton serve --stdio`. |
+| `ssh_args` | no | Extra local `ssh` argv items for explicit user config. |
+
+Security and ownership rules:
+
+- Store no raw passwords, tokens, private key contents, remote daemon state
+  directories, or remote socket paths in singleton config or SQLite.
+- `target` is passed exactly as the SSH target and must not be interpreted as a
+  local shell fragment.
+- Project-scoped config may use the default `connect_command`, but must not
+  silently introduce a non-default remote command or free-form local `ssh_args`.
+  If trust metadata reaches the connector, those project-sourced fields are
+  rejected.
+- Non-default `connect_command` is an explicit trusted-user escape hatch for
+  advanced setups such as alternate singleton binary paths.
 
 That scaffold can remain useful for tests and fallback workspace operations, but
 the preferred remote vertical slice should connect to a remote singleton stdio
@@ -78,15 +116,19 @@ local broker to know remote state paths or filesystem layout.
 
 `SshHostConnector` currently supports:
 
+- `connect_control_surface`: spawns the SSH stdio control process using the
+  configured target, optional ssh args, and default or trusted connect command.
 - `local_path`: verifies a remote directory with `test -d`
 - `git_worktree`: runs remote `git worktree add`
 - `backend_default`: creates a workspace record with no path
 - `close_resource(..., disposition: "delete")`: runs remote
   `git worktree remove`
 
-The connector only constructs and dispatches remote workspace commands. It does
-not yet install `singletond`, start remote agent runtimes, stream remote events,
-or tunnel MCP. Those belong to the next remote vertical slice.
+The connector only constructs and dispatches the SSH stdio process and remote
+workspace commands. It does not yet install `singleton`, provision remote
+worktree roots, or ingest remote event streams into the local store. Remote git
+worktree creation requires an explicit `worktree_path_hint` until a remote
+workspace allocator exists.
 
 With the config story in place, the next SSH slice should prefer a remote
 singleton stdio connector over adding more local-only remote workspace
@@ -137,15 +179,18 @@ Mapping:
 
 ## Next implementation slice
 
-1. Add config-backed SSH host descriptors with `kind`, `target`, optional
-   `connect_command`, and optional `ssh_args`.
-2. Implement an SSH stdio connector that defaults to running
-   `ssh <target> singleton serve --stdio`.
-3. Add integration tests using a fake SSH runner and, optionally, a real
-   localhost SSH target behind an ignored test.
+1. Feed `SshHostConfig` from the effective config loader with source/trust
+   metadata.
+2. Add a remote singleton bootstrap command that can install/start a remote
+   event forwarder over SSH when `singleton serve --stdio` is absent.
+3. Persist only safe SSH host metadata and external auth references.
 4. Route remote workspace/session operations through the remote singleton
    control surface and ingest ordered events into the local store.
-5. Keep the lower-level `RemoteRunner` workspace command path only as a fallback
+5. Add integration tests using a fake SSH runner and, optionally, a real
+   localhost SSH target behind an ignored test.
+6. Add a remote workspace allocator so SSH git worktrees do not require explicit
+   `worktree_path_hint`.
+7. Keep the lower-level `RemoteRunner` workspace command path only as a fallback
    or test utility unless product requirements prove it should be primary.
-6. Prototype `AhpHostConnector` only after the SSH stdio connector proves the
+8. Prototype `AhpHostConnector` only after the SSH stdio connector proves the
    host/workspace/session boundaries.
