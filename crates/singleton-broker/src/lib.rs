@@ -7,10 +7,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use singleton_core::{
     AgentBackend, BackendEvent, BackendMessage, BackendSession, BackendSessionConfig, BackendTurn,
-    Capabilities, CapabilityLimits, CleanupSummary, CloseDisposition, DEFAULT_MCP_TOOLS, Event,
-    Inbox, InboxItem, LatestOutput, LatestOutputEventRef, LatestOutputSource, PendingRequest,
-    RequestDecision, RequestKind, ResourceKind, ResourceStatus, Result, Session, SingletonError,
-    Turn, TurnId, Workspace, WorkspaceSpec, backend_payload_summary, resource_uri,
+    Capabilities, CapabilityDefaults, CapabilityLimits, CleanupSummary, CloseDisposition,
+    DEFAULT_MCP_TOOLS, Event, Inbox, InboxItem, LatestOutput, LatestOutputEventRef,
+    LatestOutputSource, PendingRequest, RequestDecision, RequestKind, ResourceKind, ResourceStatus,
+    Result, Session, SingletonError, Turn, TurnId, Workspace, WorkspaceSpec,
+    backend_payload_summary, resource_uri,
 };
 use singleton_core::{HostConnector, compact_json};
 use singleton_store::{Store, new_request, new_session, new_turn};
@@ -23,6 +24,8 @@ where
     store: Store,
     backend: Arc<B>,
     host: Arc<H>,
+    default_profile: String,
+    defaults: CapabilityDefaults,
 }
 
 impl<B, H> Clone for Broker<B, H>
@@ -35,6 +38,8 @@ where
             store: self.store.clone(),
             backend: self.backend.clone(),
             host: self.host.clone(),
+            default_profile: self.default_profile.clone(),
+            defaults: self.defaults.clone(),
         }
     }
 }
@@ -49,6 +54,8 @@ where
             store,
             backend: Arc::new(backend),
             host: Arc::new(host),
+            default_profile: "default".to_string(),
+            defaults: CapabilityDefaults::default(),
         };
         broker.reconcile_interrupted_turns();
         broker
@@ -59,9 +66,21 @@ where
             store,
             backend: Arc::new(backend),
             host: Arc::new(host),
+            default_profile: "default".to_string(),
+            defaults: CapabilityDefaults::default(),
         };
         broker.reconcile_backend_state().await?;
         Ok(broker)
+    }
+
+    pub fn with_capability_defaults(
+        mut self,
+        default_profile: impl Into<String>,
+        defaults: CapabilityDefaults,
+    ) -> Self {
+        self.default_profile = default_profile.into();
+        self.defaults = defaults;
+        self
     }
 
     pub fn store(&self) -> &Store {
@@ -69,11 +88,21 @@ where
     }
 
     pub fn get_capabilities(&self) -> Capabilities {
+        let hosts = vec![self.host.host()];
+        let mut defaults = self.defaults.clone();
+        if !hosts
+            .iter()
+            .any(|host| host.host_id == defaults.default_host)
+            && let Some(host) = hosts.first()
+        {
+            defaults.default_host = host.host_id.clone();
+        }
         Capabilities {
             protocol_version: "0.1".to_string(),
-            default_profile: "mvp".to_string(),
+            default_profile: self.default_profile.clone(),
+            defaults,
             tools: DEFAULT_MCP_TOOLS.iter().map(ToString::to_string).collect(),
-            hosts: vec![self.host.host()],
+            hosts,
             backends: vec![self.backend.capabilities()],
             limits: CapabilityLimits {
                 max_event_limit: 500,
@@ -1205,12 +1234,37 @@ pub fn ahp_like_session_snapshot(detail: &SessionDetail) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use singleton_core::{CleanupPolicy, LatestOutputSource, WorkspaceSpec};
+    use singleton_core::{
+        CapabilityDefaults, CleanupPolicy, LOCAL_HOST_ID, LatestOutputSource, WorkspaceSpec,
+    };
     use singleton_host::LocalHostConnector;
     use singleton_test_support::{FakeBackend, FakeTurnBehavior};
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn capability_defaults_do_not_advertise_unavailable_host() -> Result<()> {
+        let broker = Broker::new(
+            Store::open_memory()?,
+            FakeBackend::new(),
+            LocalHostConnector,
+        )
+        .with_capability_defaults(
+            "default",
+            CapabilityDefaults {
+                default_host: "devbox".to_string(),
+                ..CapabilityDefaults::default()
+            },
+        );
+
+        let capabilities = broker.get_capabilities();
+
+        assert_eq!(capabilities.defaults.default_host, LOCAL_HOST_ID);
+        assert_eq!(capabilities.hosts.len(), 1);
+        assert_eq!(capabilities.hosts[0].host_id, LOCAL_HOST_ID);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn create_send_and_read_events_with_fake_backend() -> Result<()> {

@@ -90,6 +90,54 @@ fn cli_concurrent_fake_daemon_starts_are_idempotent() -> TestResult<()> {
 }
 
 #[test]
+fn cli_mcp_config_uses_effective_config_and_explicit_overrides() -> TestResult<()> {
+    let dir = tempdir()?;
+    let configured_database = dir.path().join("configured.db");
+    let config_path = dir.path().join("singleton.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+version = 1
+[profiles.default]
+backend = "fake"
+database = "{}"
+"#,
+            configured_database.display()
+        ),
+    )?;
+    let config = config_path.to_string_lossy().to_string();
+
+    let output = run_singleton_slice(&["--config", &config, "--no-project-config", "mcp-config"])?;
+    let value: Value = serde_json::from_str(&output)?;
+    let args = mcp_args(&value)?;
+    assert_eq!(arg_value(args, "--backend")?, "fake");
+    assert_eq!(arg_value(args, "--config")?, config);
+    assert!(has_arg(args, "--no-project-config"));
+    assert_eq!(
+        arg_value(args, "--database")?,
+        configured_database.to_string_lossy().to_string()
+    );
+
+    let output = run_singleton_slice(&[
+        "--config",
+        &config,
+        "--no-project-config",
+        "mcp-config",
+        "--backend",
+        "copilot",
+    ])?;
+    let value: Value = serde_json::from_str(&output)?;
+    let args = mcp_args(&value)?;
+    assert_eq!(arg_value(args, "--backend")?, "copilot");
+    assert_eq!(
+        arg_value(args, "--database")?,
+        configured_database.to_string_lossy().to_string()
+    );
+    Ok(())
+}
+
+#[test]
 fn stdio_mcp_serves_fake_backend_vertical_slice() -> TestResult<()> {
     let db = NamedTempFile::new()?;
     let mut client = StdioMcpClient::spawn("fake", db.path().to_string_lossy().as_ref())?;
@@ -115,6 +163,15 @@ fn stdio_mcp_serves_fake_backend_vertical_slice() -> TestResult<()> {
 
     let capabilities = client.call_tool(3, "get_capabilities", json!({}))?;
     assert_eq!(capabilities["protocol_version"], "0.1");
+    assert_eq!(capabilities["default_profile"], "default");
+    assert_eq!(capabilities["defaults"]["backend"], "fake");
+    assert_eq!(capabilities["defaults"]["mode"], "interactive");
+    assert_eq!(capabilities["defaults"]["default_host"], "host_local");
+    assert_eq!(
+        capabilities["defaults"]["repo_workspace_provider"],
+        "git_worktree"
+    );
+    assert_eq!(capabilities["defaults"]["permissions"]["default"], "ask");
 
     let created = client.call_tool(
         4,
@@ -406,6 +463,32 @@ fn tool_payload(result: &Value) -> TestResult<Value> {
 
 fn err(message: impl Into<String>) -> Box<dyn std::error::Error> {
     std::io::Error::other(message.into()).into()
+}
+
+fn mcp_args(value: &Value) -> TestResult<&[Value]> {
+    value["mcpServers"]["singleton"]["args"]
+        .as_array()
+        .map(Vec::as_slice)
+        .ok_or_else(|| err(format!("missing singleton MCP args: {value}")))
+}
+
+fn arg_value(args: &[Value], flag: &str) -> TestResult<String> {
+    args.windows(2)
+        .find_map(|window| {
+            if window.first().and_then(Value::as_str) == Some(flag) {
+                window
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| err(format!("missing {flag} in args: {args:?}")))
+}
+
+fn has_arg(args: &[Value], flag: &str) -> bool {
+    args.iter().any(|arg| arg.as_str() == Some(flag))
 }
 
 fn run_singleton<const N: usize>(args: [&str; N]) -> TestResult<String> {

@@ -462,10 +462,43 @@ pub struct CleanupSummary {
 pub struct Capabilities {
     pub protocol_version: String,
     pub default_profile: String,
+    pub defaults: CapabilityDefaults,
     pub tools: Vec<String>,
     pub hosts: Vec<Host>,
     pub backends: Vec<BackendCapabilities>,
     pub limits: CapabilityLimits,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CapabilityDefaults {
+    pub backend: BackendId,
+    pub model: Option<String>,
+    pub mode: String,
+    pub permissions: CapabilityPermissionDefaults,
+    pub default_host: HostId,
+    pub repo_workspace_provider: String,
+    pub cleanup_policy: CleanupPolicy,
+}
+
+impl Default for CapabilityDefaults {
+    fn default() -> Self {
+        Self {
+            backend: COPILOT_BACKEND_ID.to_string(),
+            model: None,
+            mode: "interactive".to_string(),
+            permissions: CapabilityPermissionDefaults {
+                default: "ask".to_string(),
+            },
+            default_host: LOCAL_HOST_ID.to_string(),
+            repo_workspace_provider: "git_worktree".to_string(),
+            cleanup_policy: CleanupPolicy::Keep,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CapabilityPermissionDefaults {
+    pub default: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

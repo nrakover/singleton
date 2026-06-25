@@ -124,8 +124,23 @@ pub trait HostConnection: Send + Sync {
 
 First implementation: `LocalHostConnector`.
 
-Future implementations: `SshHostConnector`, cloud sandbox connectors,
-`AhpHostConnector`.
+Future implementations include an SSH remote singleton connector, cloud sandbox
+connectors, and `AhpHostConnector`.
+
+The future SSH connector should treat an SSH host as a named remote singleton
+endpoint reached over stdio:
+
+```text
+ssh [ssh_args...] target connect_command
+```
+
+`target` is the exact SSH target/alias and delegates user, port, identity, and
+proxy details to `~/.ssh/config`. `connect_command` is sent as one remote command
+argument. If trust metadata says the config came from a project-scoped source,
+non-default `connect_command` and free-form `ssh_args` must be rejected,
+including inherited values on a project-touched host id. Config and store records
+must not contain raw passwords, tokens, private key contents, remote daemon state
+directories, or remote socket paths.
 
 ### 3.3 Agent backend
 

@@ -43,40 +43,70 @@ cargo test --workspace --features live-copilot -- --ignored
 ### 2.0 Config layer
 
 - **G1. Config defaults and precedence are deterministic**
-  - **Status**: Planned.
-  - **Executable anchors**: none.
+  - **Status**: Partially enforced.
+  - **Executable anchors**: `synthesizes_no_config_defaults`,
+    `parses_toml_profiles_hosts_and_repos`,
+    `locates_user_and_project_config_paths`,
+    `invalid_config_roots_do_not_load_repo_relative_user_config`,
+    `merges_user_project_env_and_cli_precedence`,
+    `applies_env_overrides_without_files`,
+    `explicit_database_does_not_require_home`,
+    `project_config_can_be_opted_out`, `invalid_version_is_rejected`,
+    `invalid_profile_reference_is_rejected`, `invalid_host_reference_is_rejected`,
+    `invalid_enum_value_is_rejected`,
+    `invalid_repo_path_combination_is_rejected`,
+    `invalid_repo_host_reference_is_rejected`, `local_host_rejects_ssh_fields`,
+    `cli_mcp_config_uses_effective_config_and_explicit_overrides`,
+    `mcp_database_arg_uses_resolved_database_when_home_is_missing`,
+    `capability_defaults_do_not_advertise_unavailable_host`,
+    `install_mcp_preserves_config_selection_flags`,
+    `stdio_mcp_serves_fake_backend_vertical_slice`.
   - **Preconditions**: Load no config, user config, project config, environment
     overrides, and CLI/MCP request overrides across supported path locations.
   - **Postconditions**: No config is valid and synthesizes the default profile;
     precedence is built-in defaults < user config < project config < env vars <
     CLI args/MCP request fields; invalid versions, profile refs, host refs,
-    repo aliases, enum values, and path combinations fail explicitly.
+    repo aliases, enum values, and path combinations fail explicitly. Current
+    executable coverage includes the config loader, CLI backend/database
+    rendering, redacted capability defaults, and clamping advertised defaults to
+    currently advertised hosts; broker fill for omitted MCP request fields
+    remains planned.
   - **Invariants**: Runtime defaults, advertised MCP defaults, CLI rendering,
     backend selection, and host/workspace placement are all derived from the
     same `EffectiveConfig` object.
 
 - **G2. Config remains safe to load from project files**
-  - **Status**: Planned.
-  - **Executable anchors**: none.
+  - **Status**: Enforced.
+  - **Executable anchors**: `project_config_may_not_set_ssh_connect_command`,
+    `project_config_may_not_set_ssh_args`,
+    `project_config_may_not_inherit_trusted_user_ssh_args`,
+    `project_config_may_not_inherit_trusted_user_connect_command`,
+    `project_config_may_set_default_ssh_connect_command`,
+    `raw_secret_looking_ssh_fields_are_rejected`,
+    `redacted_summary_hides_ssh_sensitive_fields`.
   - **Preconditions**: Load nearest-ancestor `.singleton.toml` plus SSH host
     declarations that use `kind`, `target`, optional `connect_command`, and
     optional `ssh_args`.
   - **Postconditions**: Project config cannot silently introduce arbitrary
-    non-default SSH `connect_command` values; raw passwords, tokens, and private
-    key contents are rejected or remain unrepresentable; redacted effective
-    config contains no secret-like values.
+    non-default SSH `connect_command` values or `ssh_args`, including by
+    inheriting trusted-user fields for a project-touched host id; raw passwords,
+    tokens, and private key contents are rejected or remain unrepresentable;
+    redacted effective config contains no secret-like values.
   - **Invariants**: Project config is declarative and safe-by-schema; config-
     driven host registration never persists raw secret material to SQLite.
 
 - **G3. Repo workspace provider fallback is source-sensitive**
-  - **Status**: Planned.
-  - **Executable anchors**: none.
+  - **Status**: Partially enforced.
+  - **Executable anchors**:
+    `repo_workspace_provider_falls_back_for_plain_dirs`.
   - **Preconditions**: Resolve shorthand workspace defaults with
     `repo_workspace_provider = "git_worktree"` for git repo sources and
     ordinary non-git directories.
   - **Postconditions**: Git repo sources default to isolated worktrees;
     non-git directories fall back to `local_path`; explicit MCP
-    `WorkspaceSpec.kind` always wins.
+    `WorkspaceSpec.kind` always wins. Current executable coverage verifies the
+    effective-config fallback decision; broker-side shorthand default filling
+    remains planned.
   - **Invariants**: Config defaults can fill omitted workspace placement fields
     without overriding explicit tool input or treating arbitrary directories as
     repositories.
@@ -581,7 +611,18 @@ cargo test --workspace --features live-copilot -- --ignored
   - **Invariants**: The binary exposes a working JSON-RPC MCP vertical slice
     over stdio using the fake backend.
 
-- **L11. Live stdio MCP Copilot smoke**
+- **L11. MCP config uses effective config**
+  - **Status**: Enforced.
+  - **Executable anchors**:
+    `cli_mcp_config_uses_effective_config_and_explicit_overrides`.
+  - **Preconditions**: Run `singleton --config <file> --no-project-config
+    mcp-config`, then repeat with explicit `--backend copilot`.
+  - **Postconditions**: Generated MCP args include the config-selected database;
+    backend comes from config first and from explicit CLI override second.
+  - **Invariants**: CLI registration surfaces resolve backend/database through
+    effective config while preserving explicit overrides.
+
+- **L12. Live stdio MCP Copilot smoke**
   - **Status**: Enforced only when `live-copilot` is enabled and ignored tests
     are explicitly requested.
   - **Executable anchors**: `live_stdio_mcp_serves_copilot_backend`.
@@ -592,7 +633,7 @@ cargo test --workspace --features live-copilot -- --ignored
   - **Invariants**: Live MCP/Copilot coverage is an opt-in smoke test outside
     the default deterministic gate.
 
-- **L12. Planned CLI invariants**
+- **L13. Planned CLI invariants**
   - **Status**: Planned.
   - **Executable anchors**: none for the exact cases below.
   - **Preconditions**: Exercise `singleton serve --backend copilot` backend

@@ -75,8 +75,9 @@ singleton install-mcp --client codex
 ```
 
 Use `--dry-run` to print the exact command instead of running it. Use
-`--binary /path/to/singleton`, `--backend`, `--database`, or `--name` to
-customize the registered server.
+`--binary /path/to/singleton`, `--backend`, `--database`, `--config`,
+`--profile`, `--no-project-config`, or `--name` to customize the registered
+server.
 
 The generated client commands are:
 
@@ -149,4 +150,7 @@ ssh_args = ["-o", "BatchMode=yes"]
 `target` is the exact SSH target or alias. `connect_command` defaults to
 `singleton serve --stdio`. Do not put raw passwords, tokens, or private-key
 contents in singleton config; singleton state stores only safe references and
-metadata.
+metadata. Project config may use the default connect command, but cannot set or
+inherit non-default `connect_command` values or `ssh_args` for SSH hosts.
+SSH host descriptors are parsed for future support; they do not make remote
+workspace/session placement available yet.
