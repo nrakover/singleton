@@ -124,60 +124,8 @@ pub trait HostConnection: Send + Sync {
 
 First implementation: `LocalHostConnector`.
 
-First SSH fast-follow implementation: `SshHostConnector`.
-
-Conceptual SSH config and trust metadata:
-
-```rust
-pub struct SshHostConfig {
-    pub host_id: HostId,
-    pub target: String,
-    pub ssh_args: Vec<String>,
-    pub connect_command: String, // default: "singleton serve --stdio"
-    pub trust: SshConfigTrust,
-}
-
-pub enum SshConfigTrust {
-    TrustedUser,
-    Project,
-}
-```
-
-The connector builds the remote control process as argv, not a local shell
-string:
-
-```text
-ssh [ssh_args...] target connect_command
-```
-
-`target` is the exact SSH target/alias and delegates user, port, identity, and
-proxy details to `~/.ssh/config`. `connect_command` is sent as one remote command
-argument. If trust metadata says the config came from a project-scoped source,
-non-default `connect_command` and free-form `ssh_args` must be rejected. Config
-and store records must not contain raw passwords, tokens, private key contents,
-remote daemon state directories, or remote socket paths.
-
-`SshHostConnector` exposes an injectable process-transport seam so tests can run
-fake stdio MCP interactions without a real SSH server:
-
-```rust
-#[async_trait::async_trait]
-pub trait RemoteProcessTransport {
-    type Process: RemoteStdioProcess;
-
-    async fn spawn(&self, invocation: SshInvocation) -> Result<Self::Process, SingletonError>;
-}
-
-#[async_trait::async_trait]
-pub trait RemoteStdioProcess {
-    async fn write_stdin(&mut self, bytes: &[u8]) -> Result<(), SingletonError>;
-    async fn read_stdout_line(&mut self) -> Result<Option<Vec<u8>>, SingletonError>;
-    async fn close_stdin(&mut self) -> Result<(), SingletonError>;
-    async fn wait(&mut self) -> Result<RemoteProcessExit, SingletonError>;
-}
-```
-
-Future implementations include cloud sandbox connectors and `AhpHostConnector`.
+Future implementations: `SshHostConnector`, cloud sandbox connectors,
+`AhpHostConnector`.
 
 ### 3.3 Agent backend
 

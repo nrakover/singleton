@@ -208,10 +208,8 @@ Examples:
 - cloud sandbox
 - future external AHP host
 
-The default MVP runtime uses the local host connector. The first remote
-fast-follow slice adds an SSH control-surface connector behind the same host
-seam, while host identity, capabilities, and connection metadata remain
-first-class from the start.
+The MVP ships only the local host connector, but host identity, capabilities,
+and connection metadata are first-class from the start.
 
 ### 2.4 Workspace
 
@@ -403,30 +401,10 @@ but does not claim active-turn reattach.
 
 ### 6.2 Host connector
 
-Host placement is separate from agent backend choice. The default MVP runtime
-implements `LocalHostConnector`. The first SSH fast-follow implements enough of
-`SshHostConnector` to run a remote singleton stdio control surface using:
+Host placement is separate from agent backend choice. The MVP implements
+`LocalHostConnector`. Future connectors include:
 
-```text
-ssh [ssh_args...] target connect_command
-```
-
-SSH host config v1 is minimal:
-
-- `kind = "ssh"`
-- `target`: exact SSH target or alias; user, port, key, and proxy settings are
-  delegated to `~/.ssh/config`
-- optional `connect_command`, defaulting to `singleton serve --stdio`
-- optional `ssh_args`, passed as local `ssh` argv items
-
-Project-sourced SSH config must not silently introduce arbitrary commands:
-non-default `connect_command` values and free-form `ssh_args` require
-trusted-user configuration metadata. Singleton must not store raw passwords,
-tokens, private key contents, remote daemon state directories, or remote socket
-paths in config or SQLite.
-
-Future connectors include:
-
+- SSH remote runner
 - cloud sandbox provider
 - AHP host connector
 
@@ -550,8 +528,7 @@ cargo test --workspace --features live-copilot -- --ignored
 - no custom transcript/context manager
 - no custom model planner
 - no full filesystem mirror
-- no fully integrated SSH/cloud remote workspace and session runtime beyond the
-  first SSH stdio control-surface connector
+- no SSH/cloud host implementation
 - no runtime dependency on AHP
 - no generic scheduler beyond session dispatch, cancellation, requests, and
   event fan-in

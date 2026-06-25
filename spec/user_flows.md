@@ -382,12 +382,11 @@ Safely close long-lived resources.
 
 ---
 
-## 9. SSH Remote Host Control Surface
+## 9. Future Remote Host Flow
 
 ### Goal
 
-Connect to a remote singleton control surface over SSH while keeping the same
-foreground MCP tool model.
+Run a session on another host while keeping the same MCP control surface.
 
 ### Flow
 
@@ -400,17 +399,16 @@ foreground MCP tool model.
    connect_command = "singleton serve --stdio"
    ```
 
-2. Optional trusted-user config supplies `ssh_args` or a non-default
-   `connect_command`; otherwise `connect_command` defaults to
-   `singleton serve --stdio`.
-3. Singleton validates the config source/trust metadata when available.
-4. Foreground agent calls `get_capabilities` and sees remote host support.
-5. Singleton starts the remote stdio control surface with
-   `ssh [ssh_args...] target connect_command`.
-6. Foreground agent calls the same MCP tools against that remote control surface.
-7. Remote singleton owns its own config/state paths and provisions workspaces.
-8. Later remote workspace/session event ingestion normalizes remote events,
-   requests, and changesets into singleton's store.
+2. Foreground agent calls `get_capabilities` and sees remote host support.
+3. Foreground agent calls `ensure_workspace` with a host id and repo/worktree
+   spec.
+4. Singleton connects to the host by running
+   `ssh devbox singleton serve --stdio` unless config overrides the remote
+   command.
+5. Remote singleton owns its own config/state paths and provisions the
+   workspace.
+6. Foreground agent creates a session using that workspace.
+7. Events, requests, and changesets are normalized into singleton's store.
 
 ### Expected behavior
 
@@ -420,12 +418,6 @@ foreground MCP tool model.
   central SSH config.
 - Secrets are referenced through host/provider config, not stored raw in
   singleton's SQLite database or copied into plaintext singleton config.
-- SSH `target` is passed as the exact target/alias; user, port, identity, and
-  proxy details live in `~/.ssh/config`.
-- Singleton config does not store remote daemon state directories or socket
-  paths.
-- Project-scoped config cannot silently introduce a non-default remote
-  `connect_command` or free-form local `ssh_args`.
 - Local config does not contain remote singleton state paths; remote state is
   owned by the remote singleton instance.
 
