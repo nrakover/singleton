@@ -220,13 +220,19 @@ impl SshHostConfig {
         validate_ssh_target(&self.target)?;
         validate_ssh_args(&self.ssh_args)?;
         validate_remote_command(&self.connect_command, "connect_command")?;
-        if self.trust == SshConfigTrust::Project
-            && self.connect_command != DEFAULT_SSH_CONNECT_COMMAND
-        {
-            return Err(SingletonError::InvalidInput(
-                "project ssh host config cannot override connect_command; use trusted user config for non-default remote commands"
-                    .to_string(),
-            ));
+        if self.trust == SshConfigTrust::Project {
+            if self.connect_command != DEFAULT_SSH_CONNECT_COMMAND {
+                return Err(SingletonError::InvalidInput(
+                    "project ssh host config cannot override connect_command; use trusted user config for non-default remote commands"
+                        .to_string(),
+                ));
+            }
+            if !self.ssh_args.is_empty() {
+                return Err(SingletonError::InvalidInput(
+                    "project ssh host config cannot set ssh_args; use trusted user config for local ssh options"
+                        .to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -1088,6 +1094,19 @@ mod tests {
             result,
             Err(SingletonError::InvalidInput(message))
                 if message.contains("project ssh host config cannot override connect_command")
+        ));
+    }
+
+    #[test]
+    fn project_config_cannot_set_ssh_args() {
+        let result = SshHostConfig::from_project_config("host_ssh", "devbox")
+            .with_ssh_args(["-o", "ProxyCommand=sh"])
+            .control_invocation();
+
+        assert!(matches!(
+            result,
+            Err(SingletonError::InvalidInput(message))
+                if message.contains("project ssh host config cannot set ssh_args")
         ));
     }
 

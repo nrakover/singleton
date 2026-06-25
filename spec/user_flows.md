@@ -425,7 +425,7 @@ foreground MCP tool model.
 - Singleton config does not store remote daemon state directories or socket
   paths.
 - Project-scoped config cannot silently introduce a non-default remote
-  `connect_command`.
+  `connect_command` or free-form local `ssh_args`.
 - Local config does not contain remote singleton state paths; remote state is
   owned by the remote singleton instance.
 

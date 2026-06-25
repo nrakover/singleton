@@ -231,15 +231,18 @@ cargo test --workspace --features live-copilot -- --ignored
     `ssh_control_invocation_rejects_unsafe_target`,
     `ssh_control_invocation_rejects_newlines_in_ssh_args`,
     `project_config_cannot_override_connect_command`,
+    `project_config_cannot_set_ssh_args`,
     `project_config_can_use_default_connect_command`.
   - **Preconditions**: Build SSH host configs with an option-looking target,
     newline-bearing `ssh_args`, a project-sourced non-default connect command,
-    and a project-sourced default connect command.
+    project-sourced free-form `ssh_args`, and a project-sourced default connect
+    command.
   - **Postconditions**: Unsafe target and newline-bearing args fail explicitly;
-    project config cannot override `connect_command`; project config can use the
-    default `singleton serve --stdio`.
+    project config cannot override `connect_command` or set `ssh_args`; project
+    config can use the default `singleton serve --stdio`.
   - **Invariants**: Project config cannot silently introduce arbitrary remote
-    commands, and SSH argv fields reject control-character injection.
+    commands or local ssh options, and SSH argv fields reject control-character
+    injection.
 
 - **H6. SSH stdio transport is fakeable without an SSH server**
   - **Status**: Enforced.

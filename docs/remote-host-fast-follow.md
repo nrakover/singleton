@@ -101,8 +101,9 @@ Security and ownership rules:
 - `target` is passed exactly as the SSH target and must not be interpreted as a
   local shell fragment.
 - Project-scoped config may use the default `connect_command`, but must not
-  silently introduce a non-default remote command. If trust metadata reaches the
-  connector, project-sourced non-default `connect_command` is rejected.
+  silently introduce a non-default remote command or free-form local `ssh_args`.
+  If trust metadata reaches the connector, those project-sourced fields are
+  rejected.
 - Non-default `connect_command` is an explicit trusted-user escape hatch for
   advanced setups such as alternate singleton binary paths.
 

@@ -419,10 +419,11 @@ SSH host config v1 is minimal:
 - optional `connect_command`, defaulting to `singleton serve --stdio`
 - optional `ssh_args`, passed as local `ssh` argv items
 
-Project-sourced SSH config must not silently introduce arbitrary remote
-commands: a non-default `connect_command` requires trusted-user configuration
-metadata. Singleton must not store raw passwords, tokens, private key contents,
-remote daemon state directories, or remote socket paths in config or SQLite.
+Project-sourced SSH config must not silently introduce arbitrary commands:
+non-default `connect_command` values and free-form `ssh_args` require
+trusted-user configuration metadata. Singleton must not store raw passwords,
+tokens, private key contents, remote daemon state directories, or remote socket
+paths in config or SQLite.
 
 Future connectors include:
 

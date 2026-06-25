@@ -153,9 +153,9 @@ ssh [ssh_args...] target connect_command
 `target` is the exact SSH target/alias and delegates user, port, identity, and
 proxy details to `~/.ssh/config`. `connect_command` is sent as one remote command
 argument. If trust metadata says the config came from a project-scoped source,
-non-default `connect_command` must be rejected. Config and store records must not
-contain raw passwords, tokens, private key contents, remote daemon state
-directories, or remote socket paths.
+non-default `connect_command` and free-form `ssh_args` must be rejected. Config
+and store records must not contain raw passwords, tokens, private key contents,
+remote daemon state directories, or remote socket paths.
 
 `SshHostConnector` exposes an injectable process-transport seam so tests can run
 fake stdio MCP interactions without a real SSH server:
