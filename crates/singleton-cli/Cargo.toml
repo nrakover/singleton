@@ -23,6 +23,7 @@ singleton-copilot = { path = "../singleton-copilot" }
 singleton-core = { path = "../singleton-core" }
 singleton-host = { path = "../singleton-host" }
 singleton-mcp = { path = "../singleton-mcp" }
+singleton-remote = { path = "../singleton-remote" }
 singleton-store = { path = "../singleton-store" }
 singleton-test-support = { path = "../singleton-test-support" }
 tokio.workspace = true

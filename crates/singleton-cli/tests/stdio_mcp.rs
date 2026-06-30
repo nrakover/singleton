@@ -138,6 +138,41 @@ database = "{}"
 }
 
 #[test]
+fn cli_status_reports_configured_ssh_hosts_without_probe() -> TestResult<()> {
+    let dir = tempdir()?;
+    let database = dir.path().join("configured.db");
+    let config_path = dir.path().join("singleton.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+version = 1
+
+[profiles.default]
+backend = "fake"
+database = "{}"
+default_host = "devbox"
+
+[hosts.devbox]
+kind = "ssh"
+target = "devbox"
+"#,
+            database.display()
+        ),
+    )?;
+    let config = config_path.to_string_lossy().to_string();
+
+    let status = run_singleton_slice(&["--config", &config, "--no-project-config", "status"])?;
+
+    assert!(status.contains("ssh_hosts: 1"), "{status}");
+    assert!(
+        status.contains("devbox\tstate=NotChecked\ttarget=devbox"),
+        "{status}"
+    );
+    Ok(())
+}
+
+#[test]
 fn stdio_mcp_serves_fake_backend_vertical_slice() -> TestResult<()> {
     let db = NamedTempFile::new()?;
     let mut client = StdioMcpClient::spawn("fake", db.path().to_string_lossy().as_ref())?;

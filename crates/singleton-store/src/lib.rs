@@ -1130,6 +1130,28 @@ impl Store {
         row.map(RemoteResourceLinkRow::try_into_link).transpose()
     }
 
+    pub fn get_remote_resource_link_by_remote(
+        &self,
+        host_id: &str,
+        remote_resource_uri: &str,
+    ) -> Result<Option<RemoteResourceLink>> {
+        let conn = self.conn.lock().map_err(|_| lock_err())?;
+        let row = conn
+            .query_row(
+                r#"
+                SELECT local_resource_uri, local_resource_kind, local_id, host_id,
+                       remote_resource_uri, remote_id, remote_cursor, created_at, updated_at
+                FROM remote_resource_links
+                WHERE host_id = ?1 AND remote_resource_uri = ?2
+                "#,
+                params![host_id, remote_resource_uri],
+                remote_link_row,
+            )
+            .optional()
+            .map_err(store_err)?;
+        row.map(RemoteResourceLinkRow::try_into_link).transpose()
+    }
+
     pub fn remote_resource_links_for_host(&self, host_id: &str) -> Result<Vec<RemoteResourceLink>> {
         let conn = self.conn.lock().map_err(|_| lock_err())?;
         let mut stmt = conn

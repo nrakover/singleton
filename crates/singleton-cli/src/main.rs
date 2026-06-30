@@ -4,6 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -13,12 +14,13 @@ use serde_json::json;
 use singleton_broker::Broker;
 use singleton_config::{
     ConfigEnvironment, ConfigFieldOverrides, ConfigLoadOptions, EffectiveConfig,
-    default_database_path, load_effective_config,
+    EffectiveHostConfig, default_database_path, load_effective_config,
 };
 use singleton_copilot::CopilotBackend;
-use singleton_core::{AgentBackend, Result, SingletonError};
+use singleton_core::{AgentBackend, RemoteBrokerRegistry, Result, SingletonError};
 use singleton_host::LocalHostConnector;
 use singleton_mcp::SingletonMcpServer;
+use singleton_remote::SshRemoteBrokerRegistry;
 use singleton_store::Store;
 use singleton_test_support::FakeBackend;
 use tokio::io::AsyncWriteExt;
@@ -386,7 +388,7 @@ async fn start(
 
 async fn status(config_args: &ConfigArgs, database: Option<PathBuf>) -> Result<()> {
     let effective = resolve_effective_config(config_args, database, None)?;
-    let paths = resolve_state_paths(effective.database)?;
+    let paths = resolve_state_paths(effective.database.clone())?;
     let daemon = inspect_daemon(&paths).await?;
     println!("daemon: {}", daemon.state.label());
     println!("database: {}", paths.database.display());
@@ -410,6 +412,33 @@ async fn status(config_args: &ConfigArgs, database: Option<PathBuf>) -> Result<(
             "{}\t{:?}\t{}",
             session.session_id, session.status, session.title
         );
+    }
+    let ssh_hosts = effective
+        .hosts
+        .iter()
+        .filter_map(|(host_id, host)| match host {
+            EffectiveHostConfig::Ssh { target, .. } => Some((host_id, target)),
+            EffectiveHostConfig::Local { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    if !ssh_hosts.is_empty() {
+        let health = store
+            .list_remote_host_health()?
+            .into_iter()
+            .map(|health| (health.host_id.clone(), health))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        println!("ssh_hosts: {}", ssh_hosts.len());
+        for (host_id, target) in ssh_hosts {
+            let state = health
+                .get(host_id)
+                .map(|health| format!("{:?}", health.state))
+                .unwrap_or_else(|| "NotChecked".to_string());
+            let last_checked = health
+                .get(host_id)
+                .and_then(|health| health.last_checked_at.as_deref())
+                .unwrap_or("never");
+            println!("{host_id}\tstate={state}\ttarget={target}\tlast_checked={last_checked}");
+        }
     }
     Ok(())
 }
@@ -676,11 +705,13 @@ async fn run_backend(
     let store = Store::open(&effective.database)?;
     let default_profile = effective.profile.clone();
     let capability_defaults = effective.capability_defaults();
+    let remote_registry = remote_registry_from_effective(&effective, store.clone());
     match backend {
         BackendKind::Fake => {
             let broker = Broker::new_with_reconnect(store, FakeBackend::new(), LocalHostConnector)
                 .await?
                 .with_capability_defaults(default_profile, capability_defaults);
+            let broker = attach_remote_registry(broker, remote_registry);
             run_broker(broker, mode).await
         }
         BackendKind::Copilot => {
@@ -691,9 +722,39 @@ async fn run_backend(
             let broker = Broker::new_with_reconnect(store, backend, LocalHostConnector)
                 .await?
                 .with_capability_defaults(default_profile, capability_defaults);
+            let broker = attach_remote_registry(broker, remote_registry);
             run_broker(broker, mode).await
         }
     }
+}
+
+fn remote_registry_from_effective(
+    effective: &EffectiveConfig,
+    store: Store,
+) -> Option<Arc<dyn RemoteBrokerRegistry>> {
+    SshRemoteBrokerRegistry::from_effective_config_with_store(effective, Some(store))
+        .map(|registry| Arc::new(registry) as Arc<dyn RemoteBrokerRegistry>)
+}
+
+fn attach_remote_registry<B>(
+    broker: Broker<B, LocalHostConnector>,
+    remote_registry: Option<Arc<dyn RemoteBrokerRegistry>>,
+) -> Broker<B, LocalHostConnector>
+where
+    B: AgentBackend + 'static,
+{
+    if let Some(remote_registry) = remote_registry {
+        spawn_remote_warmup(remote_registry.clone());
+        broker.with_remote_registry(remote_registry)
+    } else {
+        broker
+    }
+}
+
+fn spawn_remote_warmup(remote_registry: Arc<dyn RemoteBrokerRegistry>) {
+    tokio::spawn(async move {
+        let _ = remote_registry.warmup_all().await;
+    });
 }
 
 async fn run_broker<B>(broker: Broker<B, LocalHostConnector>, mode: ServeMode) -> Result<()>

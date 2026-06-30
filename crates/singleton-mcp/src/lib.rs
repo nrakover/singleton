@@ -7,13 +7,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use singleton_broker::{
     AckInboxReply, AckInboxRequest, Broker, CancelTurnReply, CancelTurnRequest, CloseResourceReply,
-    CloseResourceRequest, CreateSessionReply, CreateSessionRequest, GetLatestOutputRequest,
-    ReadEventsReply, ReadEventsRequest, ResolveRequest, SendMessageReply, SendMessageRequest,
-    SessionDetail,
+    CloseResourceRequest, CreateSessionReply, CreateSessionRequest, EnsureWorkspaceRequest,
+    GetLatestOutputRequest, ReadEventsReply, ReadEventsRequest, ResolveRequest, SendMessageReply,
+    SendMessageRequest, SessionDetail,
 };
 use singleton_core::{
     AgentBackend, Capabilities, HostConnector, Inbox, LatestOutput, PendingRequest,
-    Result as SingletonResult, Session, SingletonError, Workspace, WorkspaceSpec,
+    Result as SingletonResult, Session, SingletonError, Workspace,
 };
 
 #[tool_handler(router = self.tool_router)]
@@ -88,7 +88,7 @@ where
         &self,
         Parameters(request): Parameters<EnsureWorkspaceRequest>,
     ) -> std::result::Result<Json<Workspace>, String> {
-        mcp_json(self.broker.ensure_workspace(request.spec).await)
+        mcp_json(self.broker.ensure_workspace_request(request).await)
     }
 
     #[tool(description = "Create a durable background agent session.")]
@@ -120,7 +120,7 @@ where
         &self,
         Parameters(request): Parameters<GetLatestOutputRequest>,
     ) -> std::result::Result<Json<LatestOutput>, String> {
-        mcp_json(self.broker.get_latest_output(request))
+        mcp_json(self.broker.get_latest_output(request).await)
     }
 
     #[tool(description = "List active and recent background sessions.")]
@@ -145,7 +145,7 @@ where
         &self,
         Parameters(request): Parameters<ResolveRequest>,
     ) -> std::result::Result<Json<PendingRequest>, String> {
-        mcp_json(self.broker.resolve_request(request))
+        mcp_json(self.broker.resolve_request(request).await)
     }
 
     #[tool(description = "Cancel a running turn.")]
@@ -165,11 +165,6 @@ where
     ) -> std::result::Result<Json<CloseResourceReply>, String> {
         mcp_json(self.broker.close_resource(request).await)
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct EnsureWorkspaceRequest {
-    pub spec: WorkspaceSpec,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

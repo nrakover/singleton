@@ -1,8 +1,8 @@
 # Remote Host Fast Follow
 
-Remote execution is no longer modeled as the local broker running ad hoc shell
-commands on another machine. SSH host support should mean local singleton
-brokering to a remote singleton control surface over SSH stdio.
+Remote execution is not modeled as the local broker running ad hoc shell
+commands on another machine. SSH host support means local singleton brokering to
+a remote singleton control surface over SSH stdio.
 
 ## Product model
 
@@ -38,12 +38,33 @@ The foreground MCP tool surface should stay stable. Remote placement changes
 where local singleton routes the operation, not which tool the foreground agent
 calls.
 
+## Implemented v1 slice
+
+The current SSH slice supports:
+
+- trusted SSH descriptors from effective config;
+- cached host health persisted in SQLite;
+- startup warmup scheduled in the background after broker construction;
+- MCP initialize plus `tools/call` over `ssh ... <target> <connect_command>`;
+- host routing for remote session placement;
+- remote workspace/session creation with local-to-remote resource links;
+- remote turn forwarding;
+- session-targeted event reads that call remote `read_events` from the stored
+  remote cursor and mirror unseen events locally;
+- compact latest output derived from mirrored local events;
+- request resolution, turn cancellation, and resource close forwarding when the
+  local resource has a remote link; and
+- `singleton status` showing configured SSH hosts from cached state without
+  probing.
+
+The transport currently opens a fresh SSH/MCP process per remote operation. That
+keeps the correctness surface small for v1, but a reusable per-host connection
+manager remains a follow-up.
+
 ## Connection lifecycle
 
-On daemon startup/restart, singleton should start bounded, concurrency-limited
-warmup attempts for every configured SSH host after the local daemon is ready to
-serve MCP. Warmup performs MCP initialize, singleton protocol/capability
-negotiation, remote broker identity checks, and remote backend usability checks.
+On daemon startup/restart, singleton starts warmup attempts for configured SSH
+hosts in the background. Warmup performs MCP initialize and `get_capabilities`.
 It must not create workspaces or sessions.
 
 Host health must distinguish:
@@ -56,11 +77,10 @@ Host health must distinguish:
 - `degraded`: mapped resources exist but reconciliation is incomplete
 - `backoff`: automatic reconnect is delayed after repeated failures
 
-`get_capabilities` should report cached health and never mark a fresh host
-unavailable merely because no connection has been attempted. Host-targeted reads
-should attempt bounded reconciliation before returning local mirror data. Broad
-fan-in reads should not block on every remote host, but should enqueue refreshes
-for dropped/stale hosts with active sessions.
+`get_capabilities` reports cached health and never marks a fresh host
+unavailable merely because no connection has been attempted. Session-targeted
+event and latest-output reads attempt bounded reconciliation before returning
+local mirror data. Broad fan-in reads do not block on every remote host.
 
 ## Reconnect and reconciliation
 
@@ -68,7 +88,7 @@ Reconnect is driven by startup warmup, active remote work, pending forwarded
 operations, host-targeted reads/writes, explicit refresh/doctor commands, and
 fan-in noticing stale active remote sessions.
 
-A reconnect attempt must:
+A full reusable-connection reconnect attempt should:
 
 1. Open SSH and complete MCP initialize.
 2. Verify protocol compatibility, federation/idempotency capabilities, remote
@@ -102,19 +122,28 @@ then, do not create a second protocol surface.
 
 ## Implementation stack
 
-1. Keep SSH config descriptors parsed but truthfully unavailable until runtime
-   support exists.
-2. Add federation/idempotency metadata and local-to-remote resource links.
-3. Add a remote broker client over MCP with fake remote tests.
-4. Add SSH stdio transport and clean-channel/compatibility handshake checks.
-5. Add a connection manager with startup warmup, cached health, and reconnect
-   reconciliation.
-6. Add host routing for local versus remote singleton runtimes.
-7. Forward workspace/session creation to the remote singleton.
-8. Forward turns and mirror remote events into local storage.
-9. Forward request resolution, cancellation, and cleanup with remote
-   acknowledgement semantics.
-10. Add ignored real SSH smoke tests and user-facing docs.
+Completed:
+
+1. SSH config descriptors and trust rules.
+2. Federation/idempotency metadata and local-to-remote resource links.
+3. Remote broker registry over MCP-shaped tool calls with an in-process remote
+   broker test.
+4. SSH stdio transport and clean-channel MCP initialize/tool-call checks.
+5. Background warmup and cached health.
+6. Host routing for local versus remote singleton runtimes.
+7. Remote workspace/session creation forwarding.
+8. Remote turn forwarding and event mirroring.
+9. Remote request resolution, cancellation, and cleanup forwarding.
+
+Remaining follow-up:
+
+1. Reusable per-host connection handles instead of one SSH process per operation.
+2. Operation-status querying for crash recovery after an ambiguous accepted
+   remote mutation.
+3. Strong remote broker identity persistence beyond the configured host id.
+4. Explicit `status --refresh`/doctor probing.
+5. Ignored real SSH smoke tests in environments with a configured localhost SSH
+   target.
 
 ## AHP connector direction
 

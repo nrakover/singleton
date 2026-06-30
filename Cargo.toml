@@ -7,6 +7,7 @@ members = [
     "crates/singleton-test-support",
     "crates/singleton-broker",
     "crates/singleton-mcp",
+    "crates/singleton-remote",
     "crates/singleton-copilot",
     "crates/singleton-cli",
 ]

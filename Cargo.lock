@@ -1325,6 +1325,7 @@ checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
 name = "singleton-broker"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "schemars",
  "serde",
  "serde_json",
@@ -1350,6 +1351,7 @@ dependencies = [
  "singleton-core",
  "singleton-host",
  "singleton-mcp",
+ "singleton-remote",
  "singleton-store",
  "singleton-test-support",
  "tempfile",
@@ -1416,6 +1418,18 @@ dependencies = [
  "singleton-store",
  "singleton-test-support",
  "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "singleton-remote"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde_json",
+ "singleton-config",
+ "singleton-core",
+ "singleton-store",
  "tokio",
 ]
 

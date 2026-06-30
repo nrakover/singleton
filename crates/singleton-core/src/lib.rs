@@ -185,6 +185,7 @@ pub enum ResourceStatus {
     Disposed,
     Deleted,
     Degraded,
+    Unsupported,
     NotChecked,
     Checking,
     Unavailable,
@@ -575,6 +576,19 @@ pub trait HostConnector: Send + Sync {
         disposition: CloseDisposition,
         force: bool,
     ) -> Result<CleanupSummary>;
+}
+
+#[async_trait]
+pub trait RemoteBrokerRegistry: Send + Sync {
+    fn hosts(&self) -> Vec<Host>;
+
+    fn cached_health(&self, host_id: &str) -> Option<RemoteHostHealth>;
+
+    async fn call_tool(&self, host_id: &str, tool_name: &str, arguments: Value) -> Result<Value>;
+
+    async fn warmup_all(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

@@ -122,13 +122,13 @@ pub trait HostConnection: Send + Sync {
 }
 ```
 
-First implementation: `LocalHostConnector`.
+First implementation: `LocalHostConnector`, plus SSH host routing through a
+remote broker registry.
 
-Future implementations include an SSH remote singleton connector, cloud sandbox
-connectors, and `AhpHostConnector`.
+Future implementations include cloud sandbox connectors and `AhpHostConnector`.
 
-The future SSH connector should treat an SSH host as a named remote singleton
-endpoint reached over stdio:
+The SSH connector treats an SSH host as a named remote singleton endpoint
+reached over stdio:
 
 ```text
 ssh [ssh_args...] target connect_command
