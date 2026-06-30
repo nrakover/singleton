@@ -81,17 +81,15 @@ Remaining MCP and daemon usability follow-ups:
 
 ## Remote hosts
 
-- Correct SSH docs/specs so accepted host descriptors are not confused with
-  runtime support; SSH v1 should be a remote singleton stdio connector, not
-  local ad hoc remote shell/git commands.
-- Keep SSH host descriptors inert until runtime support exists: project config
-  cannot define executable SSH details or cause remote session placement by
-  default.
-- Add capability/UX gating for configured-but-unsupported SSH hosts before any
-  connector advertises workspace providers or backends.
-- Later implement SSH stdio handshake, local/remote id mapping, mirrored event
-  replay, idempotent forwarded mutations, remote request/cancel/cleanup acks,
-  and fake remote MCP tests before user-visible SSH support.
+- Completed SSH v1 foundation: trusted descriptors, MCP-over-SSH stdio calls,
+  cached host health, local/remote id mapping, mirrored event replay, remote
+  request/cancel/cleanup forwarding, and fake remote broker tests.
+- Keep capability/UX gating conservative: configured SSH hosts start as
+  `not_checked` and only advertise remote providers/backends after a successful
+  cached remote capability handshake.
+- Follow up with reusable per-host SSH/MCP connections, explicit
+  `status --refresh`/doctor probing, stronger ambiguous-operation recovery after
+  crashes, and ignored real SSH smoke tests.
 - Evaluate cloud sandbox providers such as GitHub-hosted sessions or Daytona.
 - Support repo-homed workspaces on remote hosts.
 

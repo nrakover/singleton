@@ -36,6 +36,12 @@ Live Copilot tests are opt-in and must never run in the default CI gate:
 cargo test --workspace --features live-copilot -- --ignored
 ```
 
+Live SSH tests are opt-in and require a configured SSH target:
+
+```bash
+cargo test -p singleton-remote --features live-ssh -- --ignored
+```
+
 ---
 
 ## 2. Enforced executable invariants by layer
@@ -196,7 +202,21 @@ cargo test --workspace --features live-copilot -- --ignored
   - **Invariants**: Resolved requests are no longer actionable pending work and
     remain readable through stored state.
 
-- **S5. Planned store invariants**
+- **S5. Remote federation state is durable and idempotency-aware**
+  - **Status**: Enforced.
+  - **Executable anchors**: `remote_federation_state_roundtrips`.
+  - **Preconditions**: Persist SSH/remote host health, a local-to-remote session
+    resource link with a remote event cursor, and a forwarded operation that is
+    first pending and later applied.
+  - **Postconditions**: Host health reads back with the connection state;
+    resource links read back by local URI and host, cursor updates are durable,
+    and an applied forwarded operation is not returned as pending retry work.
+  - **Invariants**: Local resource ids, remote resource ids, host ids, remote
+    cursors, operation ids, request payloads, results, and retry status remain
+    distinct and durable so reconnect can retry or reconcile without duplicating
+    remote work.
+
+- **S6. Planned store invariants**
   - **Status**: Planned.
   - **Executable anchors**: none.
   - **Preconditions**: Persist singleton intents, event filters, request
@@ -230,26 +250,23 @@ cargo test --workspace --features live-copilot -- --ignored
   - **Invariants**: Worktree creation uses the requested repo/ref/branch/path;
     cleanup can be retried safely.
 
-- **H3. SSH worktree operations use deterministic remote commands**
-  - **Status**: Enforced.
-  - **Executable anchors**: `ssh_connector_builds_remote_worktree_commands`.
-  - **Preconditions**: Use an SSH connector with a recording runner and a git
-    worktree spec for repo `/srv/repo`, branch `feature-x`, base `main`, and
-    path `/srv/worktrees/feature-x`.
-  - **Postconditions**: Exactly two commands are recorded: quoted worktree add
-    and forced worktree remove.
-  - **Invariants**: Remote workspace lifecycle commands are deterministic and
-    quote all paths/refs before execution.
+- **H3. SSH hosts are remote singleton endpoints, not shell worktree runners**
+  - **Status**: Partially enforced.
+  - **Executable anchors**: `remote_broker_forwards_turns_and_mirrors_events`;
+    `live_ssh_get_capabilities_smoke` when `live-ssh` is enabled and ignored
+    tests are explicitly requested.
+  - **Preconditions**: Configure an SSH host descriptor and place a
+    workspace/session through the remote singleton federation path.
+  - **Postconditions**: Capabilities do not advertise remote workspace providers
+    or agent backends from config alone; remote placement is routed through a
+    remote broker registry, and tests use an in-process remote singleton rather
+    than shell/git commands. Direct unavailable-host error coverage remains
+    planned.
+  - **Invariants**: SSH support must route workspace/session lifecycle through a
+    remote singleton control surface and must not use local remote-shell
+    worktree commands as the product implementation.
 
-- **H4. Shell quoting preserves single quotes**
-  - **Status**: Enforced.
-  - **Executable anchors**: `shell_quote_handles_single_quotes`.
-  - **Preconditions**: Quote the string `a'b`.
-  - **Postconditions**: The result is `'a'"'"'b'`.
-  - **Invariants**: Shell quoting must produce a single shell token that
-    preserves embedded single quotes.
-
-- **H5. Planned host/workspace invariants**
+- **H4. Planned host/workspace invariants**
   - **Status**: Planned.
   - **Executable anchors**: none for the exact cases below.
   - **Preconditions**: Exercise branch/base-ref metadata, `keep`,
@@ -420,7 +437,21 @@ cargo test --workspace --features live-copilot -- --ignored
   - **Invariants**: When backend reattach is available, restart should recover
     active work instead of marking it interrupted.
 
-- **B13. Planned broker invariants**
+- **B13. Remote broker routing mirrors turn events locally**
+  - **Status**: Enforced.
+  - **Executable anchors**: `remote_broker_forwards_turns_and_mirrors_events`.
+  - **Preconditions**: Create a local broker with a configured remote broker
+    registry, make that remote host the default, create a session, and send a
+    message.
+  - **Postconditions**: The remote host is advertised in capabilities; session
+    and turn ids returned to the foreground are local ids; `read_events` performs
+    a remote sync and mirrors `turn.completed`; latest output is derived from
+    the mirrored local event.
+  - **Invariants**: Foreground clients keep using local singleton ids and tools;
+    remote placement changes routing only, and mirrored event reads do not expose
+    remote resource ids as authoritative local ids.
+
+- **B14. Planned broker invariants**
   - **Status**: Planned.
   - **Executable anchors**: none for the exact cases below.
   - **Preconditions**: Exercise list/get session summaries, close-session
@@ -633,7 +664,17 @@ cargo test --workspace --features live-copilot -- --ignored
   - **Invariants**: Live MCP/Copilot coverage is an opt-in smoke test outside
     the default deterministic gate.
 
-- **L13. Planned CLI invariants**
+- **L13. CLI status reports configured SSH hosts from cached state**
+  - **Status**: Enforced.
+  - **Executable anchors**: `cli_status_reports_configured_ssh_hosts_without_probe`.
+  - **Preconditions**: Load a config file with an SSH host and run
+    `singleton status` without starting a daemon or probing SSH.
+  - **Postconditions**: Status prints the configured SSH host, target, and
+    `NotChecked` cached health.
+  - **Invariants**: Ordinary status is a cached administrative view and must not
+    hang on SSH authentication or network availability.
+
+- **L14. Planned CLI invariants**
   - **Status**: Planned.
   - **Executable anchors**: none for the exact cases below.
   - **Preconditions**: Exercise `singleton serve --backend copilot` backend

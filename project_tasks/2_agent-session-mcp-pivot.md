@@ -251,16 +251,19 @@ Current artifacts: `docs/foreground-agent-coordination.md` and
 
 ### Phase 4: remote/backend fast follow
 
-- define host runner protocol
-- add SSH host support
+- define remote broker/client protocol boundaries
+- add SSH remote singleton federation support
 - evaluate cloud sandbox providers
 - evaluate `AhpHostConnector` once AHP stabilizes enough for integration
 
 Current artifacts:
 
-- `singleton-host::RemoteRunner`
-- `singleton-host::SshHostConnector`
 - `docs/remote-host-fast-follow.md`
+
+The previous lower-level SSH command runner/worktree scaffold is not the product
+path. SSH v1 should connect the local broker to a remote singleton MCP control
+surface over stdio, mirror ordered remote events into the local store, and keep
+remote workspace/session state canonical on the remote singleton.
 
 ---
 

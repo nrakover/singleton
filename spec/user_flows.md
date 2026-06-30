@@ -382,7 +382,7 @@ Safely close long-lived resources.
 
 ---
 
-## 9. Future Remote Host Flow
+## 9. SSH Remote Host Flow
 
 ### Goal
 
@@ -399,16 +399,20 @@ Run a session on another host while keeping the same MCP control surface.
    connect_command = "singleton serve --stdio"
    ```
 
-2. Foreground agent calls `get_capabilities` and sees remote host support.
-3. Foreground agent calls `ensure_workspace` with a host id and repo/worktree
-   spec.
-4. Singleton connects to the host by running
+2. Local singleton starts cached SSH warmup in the background after startup.
+3. Foreground agent calls `get_capabilities` and sees the configured host as
+   `not_checked`, `checking`, `ready`, or `unavailable` based on cached health.
+4. Foreground agent calls `ensure_workspace`/`create_session` with a host id, or
+   a default host resolves to the SSH host.
+5. Singleton connects to the host by running
    `ssh devbox singleton serve --stdio` unless config overrides the remote
    command.
-5. Remote singleton owns its own config/state paths and provisions the
+6. Remote singleton owns its own config/state paths and provisions the
    workspace.
-6. Foreground agent creates a session using that workspace.
-7. Events, requests, and changesets are normalized into singleton's store.
+7. Local singleton stores local ids and local-to-remote resource links.
+8. Foreground agent sends messages through the local tool surface.
+9. Session-targeted `read_events` reconciles from the stored remote cursor and
+   mirrors unseen remote events into singleton's local store.
 
 ### Expected behavior
 
@@ -427,8 +431,9 @@ Run a session on another host while keeping the same MCP control surface.
   fields from trusted user config for a project-touched host id.
 - Local config does not contain remote singleton state paths; remote state is
   owned by the remote singleton instance.
-- This is a future flow: until federation is implemented, configured SSH hosts
-  must not be advertised as usable for workspace/session placement.
+- The v1 transport opens SSH/MCP per operation. Reusable per-host connections,
+  explicit status refresh/doctor commands, and stronger ambiguous-operation
+  recovery remain follow-up work.
 
 ---
 

@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use singleton_core::{
@@ -13,7 +14,10 @@ use singleton_core::{
     Result, Session, SingletonError, Turn, TurnId, Workspace, WorkspaceSpec,
     backend_payload_summary, resource_uri,
 };
-use singleton_core::{HostConnector, compact_json};
+use singleton_core::{
+    HostConnector, LOCAL_HOST_ID, ReadFreshness, ReadSyncStatus, RemoteBrokerRegistry,
+    compact_json, new_id, now_rfc3339,
+};
 use singleton_store::{Store, new_request, new_session, new_turn};
 
 pub struct Broker<B, H>
@@ -24,8 +28,19 @@ where
     store: Store,
     backend: Arc<B>,
     host: Arc<H>,
+    remote_registry: Option<Arc<dyn RemoteBrokerRegistry>>,
     default_profile: String,
     defaults: CapabilityDefaults,
+}
+
+struct RemoteLinkInsert {
+    host_id: String,
+    local_resource_uri: String,
+    local_resource_kind: ResourceKind,
+    local_id: String,
+    remote_resource_uri: String,
+    remote_id: String,
+    remote_cursor: i64,
 }
 
 impl<B, H> Clone for Broker<B, H>
@@ -38,6 +53,7 @@ where
             store: self.store.clone(),
             backend: self.backend.clone(),
             host: self.host.clone(),
+            remote_registry: self.remote_registry.clone(),
             default_profile: self.default_profile.clone(),
             defaults: self.defaults.clone(),
         }
@@ -54,6 +70,7 @@ where
             store,
             backend: Arc::new(backend),
             host: Arc::new(host),
+            remote_registry: None,
             default_profile: "default".to_string(),
             defaults: CapabilityDefaults::default(),
         };
@@ -66,6 +83,7 @@ where
             store,
             backend: Arc::new(backend),
             host: Arc::new(host),
+            remote_registry: None,
             default_profile: "default".to_string(),
             defaults: CapabilityDefaults::default(),
         };
@@ -83,12 +101,20 @@ where
         self
     }
 
+    pub fn with_remote_registry(mut self, remote_registry: Arc<dyn RemoteBrokerRegistry>) -> Self {
+        self.remote_registry = Some(remote_registry);
+        self
+    }
+
     pub fn store(&self) -> &Store {
         &self.store
     }
 
     pub fn get_capabilities(&self) -> Capabilities {
-        let hosts = vec![self.host.host()];
+        let mut hosts = vec![self.host.host()];
+        if let Some(remote_registry) = &self.remote_registry {
+            hosts.extend(remote_registry.hosts());
+        }
         let mut defaults = self.defaults.clone();
         if !hosts
             .iter()
@@ -112,7 +138,23 @@ where
     }
 
     pub async fn ensure_workspace(&self, spec: WorkspaceSpec) -> Result<Workspace> {
-        let workspace = match spec {
+        self.ensure_workspace_request(EnsureWorkspaceRequest {
+            spec,
+            operation_id: None,
+        })
+        .await
+    }
+
+    pub async fn ensure_workspace_request(
+        &self,
+        request: EnsureWorkspaceRequest,
+    ) -> Result<Workspace> {
+        let host_id = self.workspace_spec_target_host(&request.spec)?;
+        if host_id != LOCAL_HOST_ID {
+            return self.ensure_remote_workspace(host_id, request).await;
+        }
+
+        let workspace = match request.spec {
             WorkspaceSpec::ExistingWorkspace { workspace_id } => {
                 self.store.get_workspace(&workspace_id)?
             }
@@ -137,6 +179,11 @@ where
         &self,
         request: CreateSessionRequest,
     ) -> Result<CreateSessionReply> {
+        let target_host = self.create_session_target_host(&request)?;
+        if target_host != LOCAL_HOST_ID {
+            return self.create_remote_session(target_host, request).await;
+        }
+
         let workspace = match request.workspace {
             Some(spec) => Some(self.ensure_workspace(spec).await?),
             None => None,
@@ -208,6 +255,12 @@ where
 
     pub async fn send_message(&self, request: SendMessageRequest) -> Result<SendMessageReply> {
         let session = self.store.get_session(&request.session_id)?;
+        if self
+            .remote_link_for_resource(&session.resource_uri)?
+            .is_some()
+        {
+            return self.send_remote_message(session, request).await;
+        }
         let backend_session = backend_session_from(&session)?;
         let mut turn = new_turn(session.session_id.clone(), request.message.clone());
         turn.status = ResourceStatus::Running;
@@ -250,6 +303,16 @@ where
     }
 
     pub async fn read_events(&self, request: ReadEventsRequest) -> Result<ReadEventsReply> {
+        let mut sync_status = None;
+        if let Some(session_id) = request
+            .session_id
+            .clone()
+            .or_else(|| session_id_from_resource_uri(request.resource_uri.as_deref()))
+        {
+            sync_status = self
+                .sync_remote_session_events(&session_id, request.wait_ms.unwrap_or(0).min(30_000))
+                .await;
+        }
         let target_uri = match (request.resource_uri, request.session_id) {
             (Some(uri), _) => Some(uri),
             (None, Some(session_id)) => Some(resource_uri(ResourceKind::Session, &session_id)),
@@ -273,13 +336,17 @@ where
                     events,
                     next_cursor,
                     timed_out: wait_ms > 0 && Instant::now() >= deadline,
+                    sync_status,
                 });
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
-    pub fn get_latest_output(&self, request: GetLatestOutputRequest) -> Result<LatestOutput> {
+    pub async fn get_latest_output(&self, request: GetLatestOutputRequest) -> Result<LatestOutput> {
+        let sync_status = self
+            .sync_remote_session_events(&request.session_id, 0)
+            .await;
         let session = self.store.get_session(&request.session_id)?;
         let turn = match request.turn_id {
             Some(turn_id) => {
@@ -297,12 +364,16 @@ where
                 .latest_terminal_turn_for_session(&session.session_id)?,
         };
         let Some(turn) = turn else {
-            return Ok(no_turn_latest_output(&session));
+            let mut output = no_turn_latest_output(&session);
+            output.sync_status = sync_status;
+            return Ok(output);
         };
         let events = self
             .store
             .read_recent_events_for_resource(&turn.resource_uri, 500)?;
-        Ok(latest_output_from_events(&session, &turn, &events))
+        let mut output = latest_output_from_events(&session, &turn, &events);
+        output.sync_status = sync_status;
+        Ok(output)
     }
 
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
@@ -405,7 +476,35 @@ where
         Ok(AckInboxReply { acknowledged })
     }
 
-    pub fn resolve_request(&self, request: ResolveRequest) -> Result<PendingRequest> {
+    pub async fn resolve_request(&self, request: ResolveRequest) -> Result<PendingRequest> {
+        let mut operation_host_id = LOCAL_HOST_ID.to_string();
+        let mut applied_operation_id = request.operation_id.clone();
+        if let Some(link) = self
+            .remote_link_for_resource(&resource_uri(ResourceKind::Request, &request.request_id))?
+        {
+            operation_host_id = link.host_id.clone();
+            let operation_id = Self::remote_operation_id(request.operation_id.clone());
+            applied_operation_id = Some(operation_id.clone());
+            self.record_operation_pending(
+                &operation_id,
+                &link.host_id,
+                "resolve_request",
+                &request,
+            )?;
+            let _: PendingRequest = self
+                .call_remote(
+                    &link.host_id,
+                    "resolve_request",
+                    ResolveRequest {
+                        request_id: link.remote_id,
+                        decision: request.decision.clone(),
+                        response: request.response.clone(),
+                        reason: request.reason.clone(),
+                        operation_id: Some(operation_id.clone()),
+                    },
+                )
+                .await?;
+        }
         let resolved = self.store.resolve_request(
             &request.request_id,
             request.decision,
@@ -424,18 +523,90 @@ where
                 "reason": resolved.reason,
             }),
         )?;
+        if let Some(operation_id) = applied_operation_id {
+            self.record_operation_applied(
+                &operation_id,
+                &operation_host_id,
+                "resolve_request",
+                Some(resolved.resource_uri.clone()),
+                &resolved,
+            )?;
+        }
         Ok(resolved)
     }
 
     pub async fn cancel_turn(&self, request: CancelTurnRequest) -> Result<CancelTurnReply> {
         let session = self.store.get_session(&request.session_id)?;
         let turn = match request.turn_id {
-            Some(turn_id) => self.store.get_turn(&turn_id)?,
+            Some(ref turn_id) => self.store.get_turn(turn_id)?,
             None => self
                 .store
                 .active_turn_for_session(&session.session_id)?
                 .ok_or_else(|| SingletonError::InvalidState("session has no active turn".into()))?,
         };
+        if let Some(turn_link) = self.remote_link_for_resource(&turn.resource_uri)? {
+            let session_link = self
+                .remote_link_for_resource(&session.resource_uri)?
+                .ok_or_else(|| {
+                    SingletonError::InvalidState(format!(
+                        "remote turn {} has no remote session link",
+                        turn.turn_id
+                    ))
+                })?;
+            let operation_id = Self::remote_operation_id(request.operation_id.clone());
+            self.record_operation_pending(
+                &operation_id,
+                &turn_link.host_id,
+                "cancel_turn",
+                &request,
+            )?;
+            let _: CancelTurnReply = self
+                .call_remote(
+                    &turn_link.host_id,
+                    "cancel_turn",
+                    CancelTurnRequest {
+                        session_id: session_link.remote_id,
+                        turn_id: Some(turn_link.remote_id.clone()),
+                        operation_id: Some(operation_id.clone()),
+                    },
+                )
+                .await?;
+            self.cancel_pending_requests_for_turn(
+                &turn,
+                "turn cancelled by foreground request".to_string(),
+            )?;
+            self.store.update_turn_status(
+                &turn.turn_id,
+                Some(&turn_link.remote_id),
+                ResourceStatus::Cancelled,
+                true,
+            )?;
+            let event = self.store.append_event(
+                &turn.resource_uri,
+                Some(&session.resource_uri),
+                "turn.cancelled",
+                "singleton",
+                "remote-broker",
+                json!({ "turn_id": turn.turn_id }),
+            )?;
+            self.store.update_session_status(
+                &session.session_id,
+                ResourceStatus::Idle,
+                Some(event.server_seq),
+            )?;
+            let reply = CancelTurnReply {
+                cancelled: true,
+                turn_id: turn.turn_id,
+            };
+            self.record_operation_applied(
+                &operation_id,
+                &turn_link.host_id,
+                "cancel_turn",
+                Some(turn.resource_uri),
+                &reply,
+            )?;
+            return Ok(reply);
+        }
         let backend_session = backend_session_from(&session)?;
         let backend_turn_id = turn
             .backend_turn_id
@@ -477,6 +648,21 @@ where
         &self,
         request: CloseResourceRequest,
     ) -> Result<CloseResourceReply> {
+        if let Some(session_id) = request.target.session_id.as_deref()
+            && self
+                .remote_link_for_resource(&resource_uri(ResourceKind::Session, session_id))?
+                .is_some()
+        {
+            return self.close_remote_resource(request).await;
+        }
+        if let Some(workspace_id) = request.target.workspace_id.as_deref()
+            && self
+                .remote_link_for_resource(&resource_uri(ResourceKind::Workspace, workspace_id))?
+                .is_some()
+        {
+            return self.close_remote_resource(request).await;
+        }
+
         let disposition = request.disposition.unwrap_or_default();
         if let Some(session_id) = request.target.session_id {
             let session = self.store.get_session(&session_id)?;
@@ -546,6 +732,857 @@ where
             target_uri: workspace.resource_uri,
             cleanup_summary,
         })
+    }
+
+    fn remote_registry(&self) -> Result<&dyn RemoteBrokerRegistry> {
+        self.remote_registry
+            .as_deref()
+            .ok_or_else(|| SingletonError::Host {
+                host: "remote".to_string(),
+                message: "no remote broker registry configured".to_string(),
+            })
+    }
+
+    async fn call_remote<T, R>(&self, host_id: &str, tool_name: &str, arguments: T) -> Result<R>
+    where
+        T: Serialize,
+        R: DeserializeOwned,
+    {
+        let arguments = serde_json::to_value(arguments).map_err(|error| {
+            SingletonError::InvalidState(format!("serialize remote {tool_name} request: {error}"))
+        })?;
+        let result = self
+            .remote_registry()?
+            .call_tool(host_id, tool_name, arguments)
+            .await?;
+        serde_json::from_value(result).map_err(|error| {
+            SingletonError::InvalidState(format!(
+                "deserialize remote {tool_name} response from host {host_id}: {error}"
+            ))
+        })
+    }
+
+    fn workspace_spec_target_host(&self, spec: &WorkspaceSpec) -> Result<String> {
+        match spec {
+            WorkspaceSpec::ExistingWorkspace { workspace_id } => {
+                Ok(self.store.get_workspace(workspace_id)?.host_id)
+            }
+            WorkspaceSpec::LocalPath { host_id, .. }
+            | WorkspaceSpec::GitWorktree { host_id, .. }
+            | WorkspaceSpec::BackendDefault { host_id, .. } => Ok(host_id
+                .clone()
+                .unwrap_or_else(|| self.defaults.default_host.clone())),
+        }
+    }
+
+    fn create_session_target_host(&self, request: &CreateSessionRequest) -> Result<String> {
+        match &request.workspace {
+            Some(spec) => self.workspace_spec_target_host(spec),
+            None => Ok(self.defaults.default_host.clone()),
+        }
+    }
+
+    fn remote_link_for_resource(
+        &self,
+        resource_uri_value: &str,
+    ) -> Result<Option<singleton_core::RemoteResourceLink>> {
+        self.store.get_remote_resource_link(resource_uri_value)
+    }
+
+    fn remote_spec_for_host(spec: WorkspaceSpec) -> WorkspaceSpec {
+        match spec {
+            WorkspaceSpec::ExistingWorkspace { workspace_id } => {
+                WorkspaceSpec::ExistingWorkspace { workspace_id }
+            }
+            WorkspaceSpec::LocalPath {
+                path,
+                cleanup_policy,
+                ..
+            } => WorkspaceSpec::LocalPath {
+                path,
+                host_id: None,
+                cleanup_policy,
+            },
+            WorkspaceSpec::GitWorktree {
+                repo,
+                base_ref,
+                branch,
+                create_branch,
+                worktree_path_hint,
+                cleanup_policy,
+                ..
+            } => WorkspaceSpec::GitWorktree {
+                repo,
+                base_ref,
+                branch,
+                create_branch,
+                worktree_path_hint,
+                host_id: None,
+                cleanup_policy,
+            },
+            WorkspaceSpec::BackendDefault { cleanup_policy, .. } => WorkspaceSpec::BackendDefault {
+                host_id: None,
+                cleanup_policy,
+            },
+        }
+    }
+
+    fn remote_operation_id(operation_id: Option<String>) -> String {
+        operation_id.unwrap_or_else(|| new_id("op"))
+    }
+
+    fn applied_operation_result<R: DeserializeOwned>(
+        &self,
+        operation_id: Option<&str>,
+    ) -> Result<Option<R>> {
+        let Some(operation_id) = operation_id else {
+            return Ok(None);
+        };
+        let Some(operation) = self.store.get_forwarded_operation(operation_id)? else {
+            return Ok(None);
+        };
+        if operation.status != singleton_core::ForwardedOperationStatus::Applied {
+            return Ok(None);
+        }
+        operation
+            .result
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| {
+                SingletonError::InvalidState(format!(
+                    "deserialize idempotent operation {operation_id} result: {error}"
+                ))
+            })
+    }
+
+    fn record_operation_pending<T: Serialize>(
+        &self,
+        operation_id: &str,
+        host_id: &str,
+        operation_kind: &str,
+        request: &T,
+    ) -> Result<()> {
+        let request = serde_json::to_value(request).map_err(|error| {
+            SingletonError::InvalidState(format!(
+                "serialize {operation_kind} operation request: {error}"
+            ))
+        })?;
+        self.store
+            .upsert_forwarded_operation(&singleton_core::ForwardedOperation::pending(
+                operation_id,
+                host_id,
+                operation_kind,
+                request,
+            ))
+    }
+
+    fn record_operation_applied<R: Serialize>(
+        &self,
+        operation_id: &str,
+        host_id: &str,
+        operation_kind: &str,
+        local_resource_uri: Option<String>,
+        result: &R,
+    ) -> Result<()> {
+        let mut operation = self
+            .store
+            .get_forwarded_operation(operation_id)?
+            .unwrap_or_else(|| {
+                singleton_core::ForwardedOperation::pending(
+                    operation_id,
+                    host_id,
+                    operation_kind,
+                    json!({}),
+                )
+            });
+        operation.status = singleton_core::ForwardedOperationStatus::Applied;
+        operation.local_resource_uri = local_resource_uri;
+        operation.result = Some(serde_json::to_value(result).map_err(|error| {
+            SingletonError::InvalidState(format!(
+                "serialize {operation_kind} operation result: {error}"
+            ))
+        })?);
+        operation.error = None;
+        operation.updated_at = now_rfc3339();
+        self.store.upsert_forwarded_operation(&operation)
+    }
+
+    fn remote_resource_id(resource_uri_value: &str) -> String {
+        resource_uri_value
+            .rsplit_once('/')
+            .map(|(_, id)| id.to_string())
+            .unwrap_or_else(|| resource_uri_value.to_string())
+    }
+
+    fn insert_remote_link(&self, link: RemoteLinkInsert) -> Result<()> {
+        let now = now_rfc3339();
+        self.store
+            .upsert_remote_resource_link(&singleton_core::RemoteResourceLink {
+                local_resource_uri: link.local_resource_uri,
+                local_resource_kind: link.local_resource_kind,
+                local_id: link.local_id,
+                host_id: link.host_id,
+                remote_resource_uri: link.remote_resource_uri,
+                remote_id: link.remote_id,
+                remote_cursor: link.remote_cursor,
+                created_at: now.clone(),
+                updated_at: now,
+            })
+    }
+
+    async fn ensure_remote_workspace(
+        &self,
+        host_id: String,
+        request: EnsureWorkspaceRequest,
+    ) -> Result<Workspace> {
+        if let WorkspaceSpec::ExistingWorkspace { workspace_id } = &request.spec {
+            return self.store.get_workspace(workspace_id);
+        }
+        if let Some(workspace) = self.applied_operation_result(request.operation_id.as_deref())? {
+            return Ok(workspace);
+        }
+        let operation_id = Self::remote_operation_id(request.operation_id.clone());
+        self.record_operation_pending(&operation_id, &host_id, "ensure_workspace", &request)?;
+        let remote_spec = Self::remote_spec_for_host(request.spec);
+        let remote_workspace: Workspace = self
+            .call_remote(
+                &host_id,
+                "ensure_workspace",
+                json!({
+                    "spec": remote_spec,
+                    "operation_id": operation_id,
+                }),
+            )
+            .await?;
+
+        if let Some(existing) = self
+            .store
+            .get_remote_resource_link_by_remote(&host_id, &remote_workspace.resource_uri)?
+        {
+            return self.store.get_workspace(&existing.local_id);
+        }
+
+        let workspace_id = new_id("work");
+        let workspace = Workspace {
+            resource_uri: resource_uri(ResourceKind::Workspace, &workspace_id),
+            workspace_id,
+            host_id: host_id.clone(),
+            status: remote_workspace.status.clone(),
+            path: remote_workspace.path.clone(),
+            repo: remote_workspace.repo.clone(),
+            cleanup_policy: remote_workspace.cleanup_policy.clone(),
+            created_at: now_rfc3339(),
+        };
+        self.store.insert_workspace(&workspace)?;
+        self.insert_remote_link(RemoteLinkInsert {
+            host_id: host_id.clone(),
+            local_resource_uri: workspace.resource_uri.clone(),
+            local_resource_kind: ResourceKind::Workspace,
+            local_id: workspace.workspace_id.clone(),
+            remote_resource_uri: remote_workspace.resource_uri.clone(),
+            remote_id: remote_workspace.workspace_id.clone(),
+            remote_cursor: 0,
+        })?;
+        self.store.append_event(
+            &workspace.resource_uri,
+            None,
+            "workspace.ready",
+            "singleton",
+            "remote-broker",
+            json!({
+                "host_id": host_id,
+                "remote_resource_uri": remote_workspace.resource_uri,
+            }),
+        )?;
+        self.record_operation_applied(
+            &operation_id,
+            &workspace.host_id,
+            "ensure_workspace",
+            Some(workspace.resource_uri.clone()),
+            &workspace,
+        )?;
+        Ok(workspace)
+    }
+
+    async fn create_remote_session(
+        &self,
+        host_id: String,
+        mut request: CreateSessionRequest,
+    ) -> Result<CreateSessionReply> {
+        if let Some(reply) = self.applied_operation_result(request.operation_id.as_deref())? {
+            return Ok(reply);
+        }
+        let operation_id = Self::remote_operation_id(request.operation_id.clone());
+        self.record_operation_pending(&operation_id, &host_id, "create_session", &request)?;
+
+        let local_workspace = match request.workspace.take() {
+            Some(spec) => Some(self.ensure_workspace(spec).await?),
+            None => None,
+        };
+        let remote_workspace = match &local_workspace {
+            Some(workspace) => {
+                let link = self
+                    .remote_link_for_resource(&workspace.resource_uri)?
+                    .ok_or_else(|| {
+                        SingletonError::InvalidState(format!(
+                            "workspace {} on host {host_id} has no remote link",
+                            workspace.workspace_id
+                        ))
+                    })?;
+                Some(WorkspaceSpec::ExistingWorkspace {
+                    workspace_id: link.remote_id,
+                })
+            }
+            None => None,
+        };
+        let remote_reply: CreateSessionReply = self
+            .call_remote(
+                &host_id,
+                "create_session",
+                CreateSessionRequest {
+                    workspace: remote_workspace,
+                    operation_id: Some(operation_id.clone()),
+                    ..request.clone()
+                },
+            )
+            .await?;
+        let remote_detail: SessionDetail = self
+            .call_remote(
+                &host_id,
+                "get_session",
+                json!({ "session_id": remote_reply.session_id }),
+            )
+            .await?;
+        let mut session = new_session(
+            remote_detail.session.title,
+            remote_detail.session.backend,
+            local_workspace
+                .as_ref()
+                .map(|workspace| workspace.workspace_id.clone()),
+        );
+        session.description = remote_detail.session.description;
+        session.labels = remote_detail.session.labels;
+        session.status = remote_detail.session.status.clone();
+        self.store.insert_session(&session)?;
+        let event = self.store.append_event(
+            &session.resource_uri,
+            None,
+            "session.created",
+            "singleton",
+            "remote-broker",
+            json!({
+                "description": request.description,
+                "host_id": host_id,
+                "remote_resource_uri": remote_detail.session.resource_uri,
+            }),
+        )?;
+        self.store.update_session_status(
+            &session.session_id,
+            remote_detail.session.status.clone(),
+            Some(event.server_seq),
+        )?;
+        self.insert_remote_link(RemoteLinkInsert {
+            host_id: host_id.clone(),
+            local_resource_uri: session.resource_uri.clone(),
+            local_resource_kind: ResourceKind::Session,
+            local_id: session.session_id.clone(),
+            remote_resource_uri: remote_detail.session.resource_uri.clone(),
+            remote_id: remote_detail.session.session_id.clone(),
+            remote_cursor: remote_reply.event_cursor,
+        })?;
+        let reply = CreateSessionReply {
+            session_id: session.session_id.clone(),
+            resource_uri: session.resource_uri.clone(),
+            workspace_id: session.workspace_id.clone(),
+            status: session.status.clone(),
+            event_cursor: event.server_seq,
+        };
+        self.record_operation_applied(
+            &operation_id,
+            &host_id,
+            "create_session",
+            Some(session.resource_uri),
+            &reply,
+        )?;
+        Ok(reply)
+    }
+
+    async fn send_remote_message(
+        &self,
+        session: Session,
+        request: SendMessageRequest,
+    ) -> Result<SendMessageReply> {
+        if let Some(reply) = self.applied_operation_result(request.operation_id.as_deref())? {
+            return Ok(reply);
+        }
+        let session_link = self
+            .remote_link_for_resource(&session.resource_uri)?
+            .ok_or_else(|| {
+                SingletonError::InvalidState(format!(
+                    "session {} has no remote link",
+                    session.session_id
+                ))
+            })?;
+        let operation_id = Self::remote_operation_id(request.operation_id.clone());
+        self.record_operation_pending(
+            &operation_id,
+            &session_link.host_id,
+            "send_message",
+            &request,
+        )?;
+
+        let mut turn = new_turn(session.session_id.clone(), request.message.clone());
+        turn.status = ResourceStatus::Running;
+        self.store.insert_turn(&turn)?;
+        let queued = self.store.append_event(
+            &turn.resource_uri,
+            Some(&session.resource_uri),
+            "turn.queued",
+            "singleton",
+            "remote-broker",
+            json!({ "message": request.message }),
+        )?;
+        let started = self.store.append_event(
+            &turn.resource_uri,
+            Some(&session.resource_uri),
+            "turn.started",
+            "singleton",
+            "remote-broker",
+            json!({ "turn_id": turn.turn_id, "host_id": session_link.host_id }),
+        )?;
+        self.store.update_session_status(
+            &session.session_id,
+            ResourceStatus::Running,
+            Some(started.server_seq),
+        )?;
+
+        let remote_reply: SendMessageReply = match self
+            .call_remote(
+                &session_link.host_id,
+                "send_message",
+                SendMessageRequest {
+                    session_id: session_link.remote_id.clone(),
+                    message: request.message,
+                    mode: request.mode,
+                    operation_id: Some(operation_id.clone()),
+                },
+            )
+            .await
+        {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.store.update_turn_status(
+                    &turn.turn_id,
+                    None,
+                    ResourceStatus::Degraded,
+                    true,
+                )?;
+                self.store.update_session_status(
+                    &session.session_id,
+                    ResourceStatus::Degraded,
+                    Some(started.server_seq),
+                )?;
+                self.store.append_event(
+                    &turn.resource_uri,
+                    Some(&session.resource_uri),
+                    "turn.degraded",
+                    "singleton",
+                    "remote-broker",
+                    json!({ "summary": error.to_string(), "retryable": true }),
+                )?;
+                return Err(error);
+            }
+        };
+        self.insert_remote_link(RemoteLinkInsert {
+            host_id: session_link.host_id.clone(),
+            local_resource_uri: turn.resource_uri.clone(),
+            local_resource_kind: ResourceKind::Turn,
+            local_id: turn.turn_id.clone(),
+            remote_resource_uri: remote_reply.resource_uri,
+            remote_id: remote_reply.turn_id,
+            remote_cursor: 0,
+        })?;
+        self.store
+            .update_remote_resource_cursor(&session.resource_uri, remote_reply.event_cursor)?;
+        let reply = SendMessageReply {
+            turn_id: turn.turn_id.clone(),
+            resource_uri: turn.resource_uri.clone(),
+            status: ResourceStatus::Running,
+            event_cursor: started.server_seq.max(queued.server_seq),
+        };
+        self.record_operation_applied(
+            &operation_id,
+            &session_link.host_id,
+            "send_message",
+            Some(turn.resource_uri),
+            &reply,
+        )?;
+        Ok(reply)
+    }
+
+    async fn close_remote_resource(
+        &self,
+        request: CloseResourceRequest,
+    ) -> Result<CloseResourceReply> {
+        let operation_id = Self::remote_operation_id(request.operation_id.clone());
+        let disposition = request.disposition.clone().unwrap_or_default();
+        if let Some(session_id) = request.target.session_id.clone() {
+            let session = self.store.get_session(&session_id)?;
+            let link = self
+                .remote_link_for_resource(&session.resource_uri)?
+                .ok_or_else(|| {
+                    SingletonError::InvalidState(format!(
+                        "session {} has no remote link",
+                        session.session_id
+                    ))
+                })?;
+            self.record_operation_pending(
+                &operation_id,
+                &link.host_id,
+                "close_resource",
+                &request,
+            )?;
+            let _: CloseResourceReply = self
+                .call_remote(
+                    &link.host_id,
+                    "close_resource",
+                    CloseResourceRequest {
+                        target: CloseResourceTarget {
+                            session_id: Some(link.remote_id),
+                            workspace_id: None,
+                            resource_uri: None,
+                        },
+                        disposition: Some(disposition.clone()),
+                        force: request.force,
+                        operation_id: Some(operation_id.clone()),
+                    },
+                )
+                .await?;
+            self.store.close_session(&session_id, disposition.clone())?;
+            self.store.append_event(
+                &session.resource_uri,
+                None,
+                "session.archived",
+                "singleton",
+                "remote-broker",
+                json!({ "disposition": disposition }),
+            )?;
+            let reply = CloseResourceReply {
+                closed: true,
+                target_uri: session.resource_uri.clone(),
+                cleanup_summary: CleanupSummary::default(),
+            };
+            self.record_operation_applied(
+                &operation_id,
+                &link.host_id,
+                "close_resource",
+                Some(session.resource_uri),
+                &reply,
+            )?;
+            return Ok(reply);
+        }
+
+        let workspace_id = match (
+            request.target.workspace_id.clone(),
+            request.target.resource_uri.clone(),
+        ) {
+            (Some(workspace_id), _) => workspace_id,
+            (None, Some(uri)) => uri
+                .strip_prefix("singleton-workspace:/")
+                .ok_or_else(|| {
+                    SingletonError::InvalidInput(format!(
+                        "close_resource only supports session_id, workspace_id, or workspace URI: {uri}"
+                    ))
+                })?
+                .to_string(),
+            (None, None) => {
+                return Err(SingletonError::InvalidInput(
+                    "close_resource target is required".to_string(),
+                ));
+            }
+        };
+        let workspace = self.store.get_workspace(&workspace_id)?;
+        let link = self
+            .remote_link_for_resource(&workspace.resource_uri)?
+            .ok_or_else(|| {
+                SingletonError::InvalidState(format!(
+                    "workspace {} has no remote link",
+                    workspace.workspace_id
+                ))
+            })?;
+        self.record_operation_pending(&operation_id, &link.host_id, "close_resource", &request)?;
+        let remote_reply: CloseResourceReply = self
+            .call_remote(
+                &link.host_id,
+                "close_resource",
+                CloseResourceRequest {
+                    target: CloseResourceTarget {
+                        session_id: None,
+                        workspace_id: Some(link.remote_id),
+                        resource_uri: None,
+                    },
+                    disposition: Some(disposition.clone()),
+                    force: request.force,
+                    operation_id: Some(operation_id.clone()),
+                },
+            )
+            .await?;
+        let status = match disposition {
+            CloseDisposition::Archive => ResourceStatus::Archived,
+            CloseDisposition::Dispose => ResourceStatus::Disposed,
+            CloseDisposition::Delete => ResourceStatus::Deleted,
+        };
+        self.store
+            .update_workspace_status(&workspace.workspace_id, status)?;
+        self.store.append_event(
+            &workspace.resource_uri,
+            None,
+            "workspace.closed",
+            "singleton",
+            "remote-broker",
+            json!({ "disposition": disposition, "cleanup": remote_reply.cleanup_summary }),
+        )?;
+        let reply = CloseResourceReply {
+            closed: true,
+            target_uri: workspace.resource_uri.clone(),
+            cleanup_summary: remote_reply.cleanup_summary,
+        };
+        self.record_operation_applied(
+            &operation_id,
+            &link.host_id,
+            "close_resource",
+            Some(workspace.resource_uri),
+            &reply,
+        )?;
+        Ok(reply)
+    }
+
+    async fn sync_remote_session_events(
+        &self,
+        session_id: &str,
+        wait_ms: u64,
+    ) -> Option<ReadSyncStatus> {
+        let session = match self.store.get_session(session_id) {
+            Ok(session) => session,
+            Err(_) => return None,
+        };
+        let link = match self.remote_link_for_resource(&session.resource_uri) {
+            Ok(Some(link)) => link,
+            Ok(None) => return None,
+            Err(error) => {
+                return Some(ReadSyncStatus {
+                    freshness: ReadFreshness::StaleReconcileFailed,
+                    host_id: None,
+                    checked_at: Some(now_rfc3339()),
+                    message: Some(error.to_string()),
+                });
+            }
+        };
+        let remote_read = self
+            .call_remote::<_, ReadEventsReply>(
+                &link.host_id,
+                "read_events",
+                ReadEventsRequest {
+                    session_id: Some(link.remote_id.clone()),
+                    resource_uri: None,
+                    cursor: Some(link.remote_cursor),
+                    limit: Some(500),
+                    event_types: Vec::new(),
+                    wait_ms: Some(wait_ms),
+                },
+            )
+            .await;
+        let remote_read = match remote_read {
+            Ok(reply) => reply,
+            Err(error) => {
+                let _ = self.store.append_event(
+                    &session.resource_uri,
+                    None,
+                    "session.degraded",
+                    "singleton",
+                    "remote-broker",
+                    json!({
+                        "host_id": link.host_id,
+                        "summary": error.to_string(),
+                    }),
+                );
+                return Some(ReadSyncStatus {
+                    freshness: ReadFreshness::StaleUnavailable,
+                    host_id: Some(link.host_id),
+                    checked_at: Some(now_rfc3339()),
+                    message: Some(error.to_string()),
+                });
+            }
+        };
+        for event in &remote_read.events {
+            if let Err(error) = self.mirror_remote_event(&link.host_id, &session, event) {
+                return Some(ReadSyncStatus {
+                    freshness: ReadFreshness::StaleReconcileFailed,
+                    host_id: Some(link.host_id),
+                    checked_at: Some(now_rfc3339()),
+                    message: Some(error.to_string()),
+                });
+            }
+        }
+        if let Err(error) = self
+            .store
+            .update_remote_resource_cursor(&session.resource_uri, remote_read.next_cursor)
+        {
+            return Some(ReadSyncStatus {
+                freshness: ReadFreshness::StaleReconcileFailed,
+                host_id: Some(link.host_id),
+                checked_at: Some(now_rfc3339()),
+                message: Some(error.to_string()),
+            });
+        }
+        Some(ReadSyncStatus {
+            freshness: ReadFreshness::Fresh,
+            host_id: Some(link.host_id),
+            checked_at: Some(now_rfc3339()),
+            message: None,
+        })
+    }
+
+    fn mirror_remote_event(&self, host_id: &str, session: &Session, event: &Event) -> Result<()> {
+        let resource_link = self
+            .store
+            .get_remote_resource_link_by_remote(host_id, &event.resource_uri)?;
+        let parent_link = event
+            .parent_resource_uri
+            .as_deref()
+            .map(|parent| {
+                self.store
+                    .get_remote_resource_link_by_remote(host_id, parent)
+            })
+            .transpose()?
+            .flatten();
+
+        if event.event_type == "request.created" {
+            let Some(turn_link) = parent_link else {
+                return Err(SingletonError::InvalidState(format!(
+                    "remote request event {} has no mapped turn parent",
+                    event.event_id
+                )));
+            };
+            if self
+                .store
+                .get_remote_resource_link_by_remote(host_id, &event.resource_uri)?
+                .is_none()
+            {
+                let request_kind = match event
+                    .payload
+                    .get("request_kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("permission")
+                {
+                    "input" => RequestKind::Input,
+                    "elicitation" => RequestKind::Elicitation,
+                    _ => RequestKind::Permission,
+                };
+                let request = new_request(
+                    session.session_id.clone(),
+                    Some(turn_link.local_id.clone()),
+                    request_kind,
+                    backend_payload_summary(&event.payload),
+                    event.payload.clone(),
+                );
+                self.store.insert_request(&request)?;
+                self.insert_remote_link(RemoteLinkInsert {
+                    host_id: host_id.to_string(),
+                    local_resource_uri: request.resource_uri.clone(),
+                    local_resource_kind: ResourceKind::Request,
+                    local_id: request.request_id.clone(),
+                    remote_resource_uri: event.resource_uri.clone(),
+                    remote_id: Self::remote_resource_id(&event.resource_uri),
+                    remote_cursor: 0,
+                })?;
+                self.store.append_event(
+                    &request.resource_uri,
+                    Some(&turn_link.local_resource_uri),
+                    &event.event_type,
+                    "remote",
+                    host_id,
+                    event.payload.clone(),
+                )?;
+            }
+            return Ok(());
+        }
+
+        let local_resource_uri = resource_link
+            .as_ref()
+            .map(|link| link.local_resource_uri.clone())
+            .unwrap_or_else(|| session.resource_uri.clone());
+        let local_parent_uri = parent_link
+            .as_ref()
+            .map(|link| link.local_resource_uri.clone())
+            .or_else(|| Some(session.resource_uri.clone()));
+        let stored = self.store.append_event(
+            &local_resource_uri,
+            local_parent_uri.as_deref(),
+            &event.event_type,
+            "remote",
+            host_id,
+            event.payload.clone(),
+        )?;
+
+        if let Some(link) = resource_link {
+            match (link.local_resource_kind, event.event_type.as_str()) {
+                (ResourceKind::Turn, "turn.completed") => {
+                    self.store.update_turn_status(
+                        &link.local_id,
+                        Some(&link.remote_id),
+                        ResourceStatus::Completed,
+                        true,
+                    )?;
+                    self.store.update_session_status(
+                        &session.session_id,
+                        ResourceStatus::Idle,
+                        Some(stored.server_seq),
+                    )?;
+                }
+                (ResourceKind::Turn, "turn.failed") => {
+                    self.store.update_turn_status(
+                        &link.local_id,
+                        Some(&link.remote_id),
+                        ResourceStatus::Failed,
+                        true,
+                    )?;
+                    self.store.update_session_status(
+                        &session.session_id,
+                        ResourceStatus::Idle,
+                        Some(stored.server_seq),
+                    )?;
+                }
+                (ResourceKind::Turn, "turn.cancelled") => {
+                    self.store.update_turn_status(
+                        &link.local_id,
+                        Some(&link.remote_id),
+                        ResourceStatus::Cancelled,
+                        true,
+                    )?;
+                    self.store.update_session_status(
+                        &session.session_id,
+                        ResourceStatus::Idle,
+                        Some(stored.server_seq),
+                    )?;
+                }
+                (ResourceKind::Turn, "turn.needs_input") => {
+                    self.store.update_turn_status(
+                        &link.local_id,
+                        Some(&link.remote_id),
+                        ResourceStatus::NeedsInput,
+                        true,
+                    )?;
+                    self.store.update_session_status(
+                        &session.session_id,
+                        ResourceStatus::NeedsInput,
+                        Some(stored.server_seq),
+                    )?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     async fn reconcile_backend_state(&self) -> Result<()> {
@@ -957,6 +1994,7 @@ fn no_turn_latest_output(session: &Session) -> LatestOutput {
         inspection_hint: Some(
             "no completed, failed, or cancelled turn exists for this session".to_string(),
         ),
+        sync_status: None,
     }
 }
 
@@ -978,6 +2016,7 @@ fn latest_output_from_events(session: &Session, turn: &Turn, events: &[Event]) -
             result_source: output.source,
             needs_event_inspection: false,
             inspection_hint: None,
+            sync_status: None,
         };
     }
 
@@ -996,6 +2035,7 @@ fn latest_output_from_events(session: &Session, turn: &Turn, events: &[Event]) -
             events.len(),
             turn.resource_uri
         )),
+        sync_status: None,
     }
 }
 
@@ -1085,12 +2125,25 @@ fn string_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
     current.as_str().filter(|text| !text.trim().is_empty())
 }
 
+fn session_id_from_resource_uri(resource_uri_value: Option<&str>) -> Option<String> {
+    resource_uri_value?
+        .strip_prefix("singleton-session:/")
+        .map(ToString::to_string)
+}
+
 fn latest_output_event_ref(event: &Event) -> LatestOutputEventRef {
     LatestOutputEventRef {
         event_id: event.event_id.clone(),
         server_seq: event.server_seq,
         event_type: event.event_type.clone(),
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EnsureWorkspaceRequest {
+    pub spec: WorkspaceSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1103,6 +2156,8 @@ pub struct CreateSessionRequest {
     pub mode: Option<String>,
     #[serde(default)]
     pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1119,6 +2174,8 @@ pub struct SendMessageRequest {
     pub session_id: String,
     pub message: String,
     pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1145,6 +2202,8 @@ pub struct ReadEventsReply {
     pub events: Vec<Event>,
     pub next_cursor: i64,
     pub timed_out: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_status: Option<ReadSyncStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1167,6 +2226,8 @@ pub struct ResolveRequest {
     pub decision: RequestDecision,
     pub response: Option<Value>,
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
@@ -1186,6 +2247,8 @@ pub struct AckInboxReply {
 pub struct CancelTurnRequest {
     pub session_id: String,
     pub turn_id: Option<TurnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1207,6 +2270,8 @@ pub struct CloseResourceRequest {
     pub disposition: Option<CloseDisposition>,
     #[serde(default)]
     pub force: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1234,14 +2299,121 @@ pub fn ahp_like_session_snapshot(detail: &SessionDetail) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
     use singleton_core::{
-        CapabilityDefaults, CleanupPolicy, LOCAL_HOST_ID, LatestOutputSource, WorkspaceSpec,
+        CapabilityDefaults, CleanupPolicy, Host, HostCapabilities, HostKind, LOCAL_HOST_ID,
+        LatestOutputSource, RemoteHostHealth, WorkspaceSpec,
     };
     use singleton_host::LocalHostConnector;
     use singleton_test_support::{FakeBackend, FakeTurnBehavior};
     use tempfile::TempDir;
 
     use super::*;
+
+    #[derive(Clone)]
+    struct InProcessRemoteBroker {
+        host: Host,
+        broker: Broker<FakeBackend, LocalHostConnector>,
+    }
+
+    impl InProcessRemoteBroker {
+        fn new(host_id: &str, backend: FakeBackend) -> Result<Self> {
+            Ok(Self {
+                host: Host {
+                    host_id: host_id.to_string(),
+                    resource_uri: resource_uri(ResourceKind::Host, host_id),
+                    kind: HostKind::Ssh,
+                    status: ResourceStatus::Ready,
+                    capabilities: HostCapabilities {
+                        workspace_providers: vec![
+                            "local_path".to_string(),
+                            "git_worktree".to_string(),
+                            "backend_default".to_string(),
+                        ],
+                        agent_backends: vec![singleton_core::FAKE_BACKEND_ID.to_string()],
+                        supports_reconnect: true,
+                        supports_ordered_events: true,
+                    },
+                },
+                broker: Broker::new(Store::open_memory()?, backend, LocalHostConnector),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl RemoteBrokerRegistry for InProcessRemoteBroker {
+        fn hosts(&self) -> Vec<Host> {
+            vec![self.host.clone()]
+        }
+
+        fn cached_health(&self, _host_id: &str) -> Option<RemoteHostHealth> {
+            None
+        }
+
+        async fn call_tool(
+            &self,
+            _host_id: &str,
+            tool_name: &str,
+            arguments: Value,
+        ) -> Result<Value> {
+            match tool_name {
+                "ensure_workspace" => {
+                    let request: EnsureWorkspaceRequest = serde_json::from_value(arguments)
+                        .map_err(|error| SingletonError::InvalidInput(error.to_string()))?;
+                    test_remote_value(self.broker.ensure_workspace_request(request).await?)
+                }
+                "create_session" => {
+                    let request: CreateSessionRequest = serde_json::from_value(arguments)
+                        .map_err(|error| SingletonError::InvalidInput(error.to_string()))?;
+                    test_remote_value(self.broker.create_session(request).await?)
+                }
+                "send_message" => {
+                    let request: SendMessageRequest = serde_json::from_value(arguments)
+                        .map_err(|error| SingletonError::InvalidInput(error.to_string()))?;
+                    test_remote_value(self.broker.send_message(request).await?)
+                }
+                "read_events" => {
+                    let request: ReadEventsRequest = serde_json::from_value(arguments)
+                        .map_err(|error| SingletonError::InvalidInput(error.to_string()))?;
+                    test_remote_value(self.broker.read_events(request).await?)
+                }
+                "get_session" => {
+                    let request: GetSessionRequestForTest = serde_json::from_value(arguments)
+                        .map_err(|error| SingletonError::InvalidInput(error.to_string()))?;
+                    test_remote_value(self.broker.get_session(&request.session_id)?)
+                }
+                "resolve_request" => {
+                    let request: ResolveRequest = serde_json::from_value(arguments)
+                        .map_err(|error| SingletonError::InvalidInput(error.to_string()))?;
+                    test_remote_value(self.broker.resolve_request(request).await?)
+                }
+                "cancel_turn" => {
+                    let request: CancelTurnRequest = serde_json::from_value(arguments)
+                        .map_err(|error| SingletonError::InvalidInput(error.to_string()))?;
+                    test_remote_value(self.broker.cancel_turn(request).await?)
+                }
+                "close_resource" => {
+                    let request: CloseResourceRequest = serde_json::from_value(arguments)
+                        .map_err(|error| SingletonError::InvalidInput(error.to_string()))?;
+                    test_remote_value(self.broker.close_resource(request).await?)
+                }
+                other => Err(SingletonError::InvalidInput(format!(
+                    "unsupported test remote tool {other}"
+                ))),
+            }
+        }
+    }
+
+    fn test_remote_value<T: Serialize>(value: T) -> Result<Value> {
+        serde_json::to_value(value).map_err(|error| {
+            SingletonError::InvalidState(format!("serialize remote test result: {error}"))
+        })
+    }
+
+    #[derive(Deserialize)]
+    struct GetSessionRequestForTest {
+        session_id: String,
+    }
 
     #[test]
     fn capability_defaults_do_not_advertise_unavailable_host() -> Result<()> {
@@ -1267,6 +2439,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_broker_forwards_turns_and_mirrors_events() -> Result<()> {
+        let remote = InProcessRemoteBroker::new(
+            "devbox",
+            FakeBackend::with_behaviors([FakeTurnBehavior::Complete {
+                summary: "remote turn completed".to_string(),
+            }]),
+        )?;
+        let broker = Broker::new(
+            Store::open_memory()?,
+            FakeBackend::new(),
+            LocalHostConnector,
+        )
+        .with_capability_defaults(
+            "default",
+            CapabilityDefaults {
+                default_host: "devbox".to_string(),
+                ..CapabilityDefaults::default()
+            },
+        )
+        .with_remote_registry(Arc::new(remote));
+
+        let capabilities = broker.get_capabilities();
+        assert_eq!(capabilities.defaults.default_host, "devbox");
+        assert!(
+            capabilities
+                .hosts
+                .iter()
+                .any(|host| host.host_id == "devbox" && host.kind == HostKind::Ssh)
+        );
+
+        let created = broker
+            .create_session(CreateSessionRequest {
+                description: "Remote session".to_string(),
+                title: None,
+                backend: None,
+                workspace: None,
+                model: None,
+                mode: None,
+                labels: Vec::new(),
+                operation_id: Some("op_remote_create".to_string()),
+            })
+            .await?;
+        let sent = broker
+            .send_message(SendMessageRequest {
+                session_id: created.session_id.clone(),
+                message: "hello remote".to_string(),
+                mode: None,
+                operation_id: Some("op_remote_send".to_string()),
+            })
+            .await?;
+        let events = broker
+            .read_events(ReadEventsRequest {
+                session_id: Some(created.session_id.clone()),
+                cursor: Some(sent.event_cursor),
+                limit: Some(100),
+                event_types: vec!["turn.completed".to_string()],
+                wait_ms: Some(1_000),
+                resource_uri: None,
+            })
+            .await?;
+
+        assert_eq!(
+            events.sync_status.as_ref().map(|status| &status.freshness),
+            Some(&ReadFreshness::Fresh)
+        );
+        assert!(
+            events
+                .events
+                .iter()
+                .any(|event| event.event_type == "turn.completed")
+        );
+        let latest = broker
+            .get_latest_output(GetLatestOutputRequest {
+                session_id: created.session_id,
+                turn_id: Some(sent.turn_id),
+            })
+            .await?;
+        assert_eq!(latest.result_text.as_deref(), Some("remote turn completed"));
+        assert_eq!(latest.result_source, LatestOutputSource::TurnSummary);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn create_send_and_read_events_with_fake_backend() -> Result<()> {
         let temp = TempDir::new()
             .map_err(|error| SingletonError::Store(format!("create temp dir: {error}")))?;
@@ -1288,6 +2543,7 @@ mod tests {
                 model: None,
                 mode: None,
                 labels: vec!["test".to_string()],
+                operation_id: None,
             })
             .await?;
         let sent = broker
@@ -1295,6 +2551,7 @@ mod tests {
                 session_id: created.session_id.clone(),
                 message: "hello".to_string(),
                 mode: None,
+                operation_id: None,
             })
             .await?;
 
@@ -1335,6 +2592,7 @@ mod tests {
                 session_id: created.session_id.clone(),
                 message: "finish".to_string(),
                 mode: None,
+                operation_id: None,
             })
             .await?;
         broker
@@ -1348,10 +2606,12 @@ mod tests {
             })
             .await?;
 
-        let output = broker.get_latest_output(GetLatestOutputRequest {
-            session_id: created.session_id,
-            turn_id: None,
-        })?;
+        let output = broker
+            .get_latest_output(GetLatestOutputRequest {
+                session_id: created.session_id,
+                turn_id: None,
+            })
+            .await?;
 
         assert_eq!(output.turn_id.as_deref(), Some(sent.turn_id.as_str()));
         assert_eq!(output.status, Some(ResourceStatus::Completed));
@@ -1383,6 +2643,7 @@ mod tests {
                 session_id: created.session_id.clone(),
                 message: "fail".to_string(),
                 mode: None,
+                operation_id: None,
             })
             .await?;
         broker
@@ -1396,10 +2657,12 @@ mod tests {
             })
             .await?;
 
-        let output = broker.get_latest_output(GetLatestOutputRequest {
-            session_id: created.session_id,
-            turn_id: Some(sent.turn_id),
-        })?;
+        let output = broker
+            .get_latest_output(GetLatestOutputRequest {
+                session_id: created.session_id,
+                turn_id: Some(sent.turn_id),
+            })
+            .await?;
 
         assert_eq!(output.status, Some(ResourceStatus::Failed));
         assert_eq!(
@@ -1424,6 +2687,7 @@ mod tests {
                 session_id: created.session_id.clone(),
                 message: "finish quietly".to_string(),
                 mode: None,
+                operation_id: None,
             })
             .await?;
         broker
@@ -1437,10 +2701,12 @@ mod tests {
             })
             .await?;
 
-        let output = broker.get_latest_output(GetLatestOutputRequest {
-            session_id: created.session_id,
-            turn_id: None,
-        })?;
+        let output = broker
+            .get_latest_output(GetLatestOutputRequest {
+                session_id: created.session_id,
+                turn_id: None,
+            })
+            .await?;
 
         assert_eq!(output.status, Some(ResourceStatus::Completed));
         assert_eq!(output.result_text, None);
@@ -1466,10 +2732,12 @@ mod tests {
         );
         let created = create_basic_session(&broker, "Latest output no turn").await?;
 
-        let output = broker.get_latest_output(GetLatestOutputRequest {
-            session_id: created.session_id.clone(),
-            turn_id: None,
-        })?;
+        let output = broker
+            .get_latest_output(GetLatestOutputRequest {
+                session_id: created.session_id.clone(),
+                turn_id: None,
+            })
+            .await?;
 
         assert_eq!(output.session_id, created.session_id);
         assert_eq!(output.turn_id, None);
@@ -1499,6 +2767,7 @@ mod tests {
                 model: None,
                 mode: None,
                 labels: Vec::new(),
+                operation_id: None,
             })
             .await?;
         broker
@@ -1506,6 +2775,7 @@ mod tests {
                 session_id: created.session_id,
                 message: "run command".to_string(),
                 mode: None,
+                operation_id: None,
             })
             .await?;
         broker
@@ -1528,12 +2798,15 @@ mod tests {
                 ));
             }
         };
-        let resolved = broker.resolve_request(ResolveRequest {
-            request_id,
-            decision: RequestDecision::Approve,
-            response: Some(json!({ "scope": "once" })),
-            reason: None,
-        })?;
+        let resolved = broker
+            .resolve_request(ResolveRequest {
+                request_id,
+                decision: RequestDecision::Approve,
+                response: Some(json!({ "scope": "once" })),
+                reason: None,
+                operation_id: None,
+            })
+            .await?;
         assert_eq!(resolved.status, singleton_core::RequestStatus::Resolved);
         Ok(())
     }
@@ -1560,6 +2833,7 @@ mod tests {
                 model: None,
                 mode: None,
                 labels: Vec::new(),
+                operation_id: None,
             })
             .await?;
 
@@ -1572,6 +2846,7 @@ mod tests {
                 },
                 disposition: Some(CloseDisposition::Delete),
                 force: false,
+                operation_id: None,
             })
             .await;
         assert!(err.is_err());
@@ -1594,6 +2869,7 @@ mod tests {
                 model: None,
                 mode: None,
                 labels: Vec::new(),
+                operation_id: None,
             })
             .await?;
         let detail = broker.get_session(&created.session_id)?;
@@ -1647,6 +2923,7 @@ mod tests {
                 model: None,
                 mode: None,
                 labels: Vec::new(),
+                operation_id: None,
             })
             .await?;
         let sent = broker
@@ -1654,6 +2931,7 @@ mod tests {
                 session_id: created.session_id,
                 message: "finish".to_string(),
                 mode: None,
+                operation_id: None,
             })
             .await?;
         broker
@@ -1696,6 +2974,7 @@ mod tests {
                 model: None,
                 mode: None,
                 labels: Vec::new(),
+                operation_id: None,
             })
             .await?;
         let sent = broker
@@ -1703,6 +2982,7 @@ mod tests {
                 session_id: created.session_id.clone(),
                 message: "needs permission".to_string(),
                 mode: None,
+                operation_id: None,
             })
             .await?;
         broker
@@ -1721,6 +3001,7 @@ mod tests {
             .cancel_turn(CancelTurnRequest {
                 session_id: created.session_id,
                 turn_id: Some(sent.turn_id),
+                operation_id: None,
             })
             .await?;
 
@@ -1779,6 +3060,7 @@ mod tests {
                 model: None,
                 mode: None,
                 labels: Vec::new(),
+                operation_id: None,
             })
             .await
     }

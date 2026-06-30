@@ -6,9 +6,11 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use singleton_core::{
-    BackendSessionId, CloseDisposition, Event, PendingRequest, RepoMetadata, RequestDecision,
-    RequestKind, RequestStatus, ResourceKind, ResourceStatus, Result, Session, SessionId,
-    SingletonError, Turn, TurnId, Workspace, WorkspaceId, new_id, now_rfc3339, resource_uri,
+    BackendSessionId, CloseDisposition, Event, ForwardedOperation, ForwardedOperationStatus,
+    PendingRequest, RemoteBrokerIdentity, RemoteHostHealth, RemoteResourceLink, RepoMetadata,
+    RequestDecision, RequestKind, RequestStatus, ResourceKind, ResourceStatus, Result, Session,
+    SessionId, SingletonError, Turn, TurnId, Workspace, WorkspaceId, new_id, now_rfc3339,
+    resource_uri,
 };
 
 #[derive(Clone)]
@@ -147,10 +149,49 @@ impl Store {
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS remote_hosts (
+                host_id TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                remote_identity_json TEXT,
+                capabilities_json TEXT,
+                last_checked_at TEXT,
+                last_success_at TEXT,
+                last_error TEXT,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS remote_resource_links (
+                local_resource_uri TEXT PRIMARY KEY,
+                local_resource_kind TEXT NOT NULL,
+                local_id TEXT NOT NULL,
+                host_id TEXT NOT NULL,
+                remote_resource_uri TEXT NOT NULL,
+                remote_id TEXT NOT NULL,
+                remote_cursor INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(host_id, remote_resource_uri)
+            );
+
+            CREATE TABLE IF NOT EXISTS forwarded_operations (
+                operation_id TEXT PRIMARY KEY,
+                host_id TEXT NOT NULL,
+                operation_kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                local_resource_uri TEXT,
+                request_json TEXT NOT NULL,
+                result_json TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_events_resource_seq ON events(resource_uri, server_seq);
             CREATE INDEX IF NOT EXISTS idx_events_parent_seq ON events(parent_resource_uri, server_seq);
             CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status);
             CREATE INDEX IF NOT EXISTS idx_turns_session_status ON turns(session_id, status);
+            CREATE INDEX IF NOT EXISTS idx_remote_links_host ON remote_resource_links(host_id);
+            CREATE INDEX IF NOT EXISTS idx_forwarded_operations_host_status ON forwarded_operations(host_id, status);
             "#,
         )
         .map_err(store_err)?;
@@ -965,6 +1006,277 @@ impl Store {
         self.update_session_status(session_id, status, None)
     }
 
+    pub fn upsert_remote_host_health(&self, health: &RemoteHostHealth) -> Result<()> {
+        let conn = self.conn.lock().map_err(|_| lock_err())?;
+        conn.execute(
+            r#"
+            INSERT INTO remote_hosts
+            (host_id, state, remote_identity_json, capabilities_json, last_checked_at,
+             last_success_at, last_error, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ON CONFLICT(host_id) DO UPDATE SET
+                state = excluded.state,
+                remote_identity_json = excluded.remote_identity_json,
+                capabilities_json = excluded.capabilities_json,
+                last_checked_at = excluded.last_checked_at,
+                last_success_at = excluded.last_success_at,
+                last_error = excluded.last_error,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                health.host_id,
+                enum_to_string(&health.state)?,
+                opt_json(&health.remote_identity)?,
+                opt_json(&health.capabilities)?,
+                health.last_checked_at,
+                health.last_success_at,
+                health.last_error,
+                health.updated_at
+            ],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    pub fn get_remote_host_health(&self, host_id: &str) -> Result<Option<RemoteHostHealth>> {
+        let conn = self.conn.lock().map_err(|_| lock_err())?;
+        let row = conn
+            .query_row(
+                r#"
+                SELECT host_id, state, remote_identity_json, capabilities_json, last_checked_at,
+                       last_success_at, last_error, updated_at
+                FROM remote_hosts
+                WHERE host_id = ?1
+                "#,
+                params![host_id],
+                remote_host_row,
+            )
+            .optional()
+            .map_err(store_err)?;
+        row.map(RemoteHostRow::try_into_health).transpose()
+    }
+
+    pub fn list_remote_host_health(&self) -> Result<Vec<RemoteHostHealth>> {
+        let conn = self.conn.lock().map_err(|_| lock_err())?;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT host_id, state, remote_identity_json, capabilities_json, last_checked_at,
+                       last_success_at, last_error, updated_at
+                FROM remote_hosts
+                ORDER BY host_id ASC
+                "#,
+            )
+            .map_err(store_err)?;
+        let mut rows = stmt.query([]).map_err(store_err)?;
+        let mut health = Vec::new();
+        while let Some(row) = rows.next().map_err(store_err)? {
+            health.push(remote_host_row(row).map_err(store_err)?.try_into_health()?);
+        }
+        Ok(health)
+    }
+
+    pub fn upsert_remote_resource_link(&self, link: &RemoteResourceLink) -> Result<()> {
+        let conn = self.conn.lock().map_err(|_| lock_err())?;
+        conn.execute(
+            r#"
+            INSERT INTO remote_resource_links
+            (local_resource_uri, local_resource_kind, local_id, host_id, remote_resource_uri,
+             remote_id, remote_cursor, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(local_resource_uri) DO UPDATE SET
+                local_resource_kind = excluded.local_resource_kind,
+                local_id = excluded.local_id,
+                host_id = excluded.host_id,
+                remote_resource_uri = excluded.remote_resource_uri,
+                remote_id = excluded.remote_id,
+                remote_cursor = excluded.remote_cursor,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                link.local_resource_uri,
+                enum_to_string(&link.local_resource_kind)?,
+                link.local_id,
+                link.host_id,
+                link.remote_resource_uri,
+                link.remote_id,
+                link.remote_cursor,
+                link.created_at,
+                link.updated_at
+            ],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    pub fn get_remote_resource_link(
+        &self,
+        local_resource_uri: &str,
+    ) -> Result<Option<RemoteResourceLink>> {
+        let conn = self.conn.lock().map_err(|_| lock_err())?;
+        let row = conn
+            .query_row(
+                r#"
+                SELECT local_resource_uri, local_resource_kind, local_id, host_id,
+                       remote_resource_uri, remote_id, remote_cursor, created_at, updated_at
+                FROM remote_resource_links
+                WHERE local_resource_uri = ?1
+                "#,
+                params![local_resource_uri],
+                remote_link_row,
+            )
+            .optional()
+            .map_err(store_err)?;
+        row.map(RemoteResourceLinkRow::try_into_link).transpose()
+    }
+
+    pub fn get_remote_resource_link_by_remote(
+        &self,
+        host_id: &str,
+        remote_resource_uri: &str,
+    ) -> Result<Option<RemoteResourceLink>> {
+        let conn = self.conn.lock().map_err(|_| lock_err())?;
+        let row = conn
+            .query_row(
+                r#"
+                SELECT local_resource_uri, local_resource_kind, local_id, host_id,
+                       remote_resource_uri, remote_id, remote_cursor, created_at, updated_at
+                FROM remote_resource_links
+                WHERE host_id = ?1 AND remote_resource_uri = ?2
+                "#,
+                params![host_id, remote_resource_uri],
+                remote_link_row,
+            )
+            .optional()
+            .map_err(store_err)?;
+        row.map(RemoteResourceLinkRow::try_into_link).transpose()
+    }
+
+    pub fn remote_resource_links_for_host(&self, host_id: &str) -> Result<Vec<RemoteResourceLink>> {
+        let conn = self.conn.lock().map_err(|_| lock_err())?;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT local_resource_uri, local_resource_kind, local_id, host_id,
+                       remote_resource_uri, remote_id, remote_cursor, created_at, updated_at
+                FROM remote_resource_links
+                WHERE host_id = ?1
+                ORDER BY created_at ASC
+                "#,
+            )
+            .map_err(store_err)?;
+        let mut rows = stmt.query(params![host_id]).map_err(store_err)?;
+        let mut links = Vec::new();
+        while let Some(row) = rows.next().map_err(store_err)? {
+            links.push(remote_link_row(row).map_err(store_err)?.try_into_link()?);
+        }
+        Ok(links)
+    }
+
+    pub fn update_remote_resource_cursor(
+        &self,
+        local_resource_uri: &str,
+        remote_cursor: i64,
+    ) -> Result<()> {
+        let now = now_rfc3339();
+        let conn = self.conn.lock().map_err(|_| lock_err())?;
+        conn.execute(
+            r#"
+            UPDATE remote_resource_links
+            SET remote_cursor = ?2, updated_at = ?3
+            WHERE local_resource_uri = ?1
+            "#,
+            params![local_resource_uri, remote_cursor, now],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    pub fn upsert_forwarded_operation(&self, operation: &ForwardedOperation) -> Result<()> {
+        let conn = self.conn.lock().map_err(|_| lock_err())?;
+        conn.execute(
+            r#"
+            INSERT INTO forwarded_operations
+            (operation_id, host_id, operation_kind, status, local_resource_uri, request_json,
+             result_json, error, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ON CONFLICT(operation_id) DO UPDATE SET
+                host_id = excluded.host_id,
+                operation_kind = excluded.operation_kind,
+                status = excluded.status,
+                local_resource_uri = excluded.local_resource_uri,
+                request_json = excluded.request_json,
+                result_json = excluded.result_json,
+                error = excluded.error,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                operation.operation_id,
+                operation.host_id,
+                operation.operation_kind,
+                enum_to_string(&operation.status)?,
+                operation.local_resource_uri,
+                json_string(&operation.request)?,
+                opt_json(&operation.result)?,
+                operation.error,
+                operation.created_at,
+                operation.updated_at
+            ],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    pub fn get_forwarded_operation(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<ForwardedOperation>> {
+        let conn = self.conn.lock().map_err(|_| lock_err())?;
+        let row = conn
+            .query_row(
+                r#"
+                SELECT operation_id, host_id, operation_kind, status, local_resource_uri,
+                       request_json, result_json, error, created_at, updated_at
+                FROM forwarded_operations
+                WHERE operation_id = ?1
+                "#,
+                params![operation_id],
+                forwarded_operation_row,
+            )
+            .optional()
+            .map_err(store_err)?;
+        row.map(ForwardedOperationRow::try_into_operation)
+            .transpose()
+    }
+
+    pub fn pending_forwarded_operations_for_host(
+        &self,
+        host_id: &str,
+    ) -> Result<Vec<ForwardedOperation>> {
+        let conn = self.conn.lock().map_err(|_| lock_err())?;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT operation_id, host_id, operation_kind, status, local_resource_uri,
+                       request_json, result_json, error, created_at, updated_at
+                FROM forwarded_operations
+                WHERE host_id = ?1 AND status IN ('pending', 'uncertain')
+                ORDER BY created_at ASC
+                "#,
+            )
+            .map_err(store_err)?;
+        let mut rows = stmt.query(params![host_id]).map_err(store_err)?;
+        let mut operations = Vec::new();
+        while let Some(row) = rows.next().map_err(store_err)? {
+            operations.push(
+                forwarded_operation_row(row)
+                    .map_err(store_err)?
+                    .try_into_operation()?,
+            );
+        }
+        Ok(operations)
+    }
+
     fn put_resource_state<T: Serialize>(
         &self,
         resource_uri_value: &str,
@@ -1140,6 +1452,90 @@ impl EventRow {
     }
 }
 
+struct RemoteHostRow {
+    host_id: String,
+    state: String,
+    remote_identity_json: Option<String>,
+    capabilities_json: Option<String>,
+    last_checked_at: Option<String>,
+    last_success_at: Option<String>,
+    last_error: Option<String>,
+    updated_at: String,
+}
+
+impl RemoteHostRow {
+    fn try_into_health(self) -> Result<RemoteHostHealth> {
+        Ok(RemoteHostHealth {
+            host_id: self.host_id,
+            state: enum_from_string(&self.state)?,
+            remote_identity: opt_from_json::<RemoteBrokerIdentity>(self.remote_identity_json)?,
+            capabilities: opt_from_json(self.capabilities_json)?,
+            last_checked_at: self.last_checked_at,
+            last_success_at: self.last_success_at,
+            last_error: self.last_error,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
+struct RemoteResourceLinkRow {
+    local_resource_uri: String,
+    local_resource_kind: String,
+    local_id: String,
+    host_id: String,
+    remote_resource_uri: String,
+    remote_id: String,
+    remote_cursor: i64,
+    created_at: String,
+    updated_at: String,
+}
+
+impl RemoteResourceLinkRow {
+    fn try_into_link(self) -> Result<RemoteResourceLink> {
+        Ok(RemoteResourceLink {
+            local_resource_uri: self.local_resource_uri,
+            local_resource_kind: enum_from_string(&self.local_resource_kind)?,
+            local_id: self.local_id,
+            host_id: self.host_id,
+            remote_resource_uri: self.remote_resource_uri,
+            remote_id: self.remote_id,
+            remote_cursor: self.remote_cursor,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
+struct ForwardedOperationRow {
+    operation_id: String,
+    host_id: String,
+    operation_kind: String,
+    status: String,
+    local_resource_uri: Option<String>,
+    request_json: String,
+    result_json: Option<String>,
+    error: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl ForwardedOperationRow {
+    fn try_into_operation(self) -> Result<ForwardedOperation> {
+        Ok(ForwardedOperation {
+            operation_id: self.operation_id,
+            host_id: self.host_id,
+            operation_kind: self.operation_kind,
+            status: enum_from_string::<ForwardedOperationStatus>(&self.status)?,
+            local_resource_uri: self.local_resource_uri,
+            request: from_json(&self.request_json)?,
+            result: opt_from_json(self.result_json)?,
+            error: self.error,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
 fn session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
         session_id: row.get(0)?,
@@ -1199,6 +1595,48 @@ fn event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
         origin_id: row.get(6)?,
         payload_json: row.get(7)?,
         created_at: row.get(8)?,
+    })
+}
+
+fn remote_host_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteHostRow> {
+    Ok(RemoteHostRow {
+        host_id: row.get(0)?,
+        state: row.get(1)?,
+        remote_identity_json: row.get(2)?,
+        capabilities_json: row.get(3)?,
+        last_checked_at: row.get(4)?,
+        last_success_at: row.get(5)?,
+        last_error: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
+}
+
+fn remote_link_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteResourceLinkRow> {
+    Ok(RemoteResourceLinkRow {
+        local_resource_uri: row.get(0)?,
+        local_resource_kind: row.get(1)?,
+        local_id: row.get(2)?,
+        host_id: row.get(3)?,
+        remote_resource_uri: row.get(4)?,
+        remote_id: row.get(5)?,
+        remote_cursor: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+fn forwarded_operation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ForwardedOperationRow> {
+    Ok(ForwardedOperationRow {
+        operation_id: row.get(0)?,
+        host_id: row.get(1)?,
+        operation_kind: row.get(2)?,
+        status: row.get(3)?,
+        local_resource_uri: row.get(4)?,
+        request_json: row.get(5)?,
+        result_json: row.get(6)?,
+        error: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
     })
 }
 
@@ -1339,7 +1777,10 @@ pub fn workspace_from_repo(path: String, repo: RepoMetadata) -> Workspace {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use singleton_core::{CleanupPolicy, ResourceKind, Workspace};
+    use singleton_core::{
+        CleanupPolicy, ForwardedOperationStatus, HostConnectionState, RemoteBrokerIdentity,
+        RemoteHostHealth, RemoteResourceLink, ResourceKind, Workspace,
+    };
     use tempfile::NamedTempFile;
 
     use super::*;
@@ -1453,6 +1894,72 @@ mod tests {
 
         assert_eq!(resolved.status, RequestStatus::Resolved);
         assert_eq!(store.pending_requests()?.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_federation_state_roundtrips() -> Result<()> {
+        let store = Store::open_memory()?;
+        let now = now_rfc3339();
+        let health = RemoteHostHealth {
+            host_id: "devbox".to_string(),
+            state: HostConnectionState::Available,
+            remote_identity: Some(RemoteBrokerIdentity {
+                broker_id: "remote-state-1".to_string(),
+                protocol_version: "0.1".to_string(),
+            }),
+            capabilities: None,
+            last_checked_at: Some(now.clone()),
+            last_success_at: Some(now.clone()),
+            last_error: None,
+            updated_at: now.clone(),
+        };
+        store.upsert_remote_host_health(&health)?;
+        assert_eq!(
+            store.get_remote_host_health("devbox")?.map(|h| h.state),
+            Some(HostConnectionState::Available)
+        );
+
+        let link = RemoteResourceLink {
+            local_resource_uri: resource_uri(ResourceKind::Session, "sess_local"),
+            local_resource_kind: ResourceKind::Session,
+            local_id: "sess_local".to_string(),
+            host_id: "devbox".to_string(),
+            remote_resource_uri: resource_uri(ResourceKind::Session, "sess_remote"),
+            remote_id: "sess_remote".to_string(),
+            remote_cursor: 7,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        store.upsert_remote_resource_link(&link)?;
+        store.update_remote_resource_cursor(&link.local_resource_uri, 9)?;
+        let stored_link = store
+            .get_remote_resource_link(&link.local_resource_uri)?
+            .ok_or_else(|| SingletonError::Store("remote link missing".to_string()))?;
+        assert_eq!(stored_link.remote_cursor, 9);
+        assert_eq!(store.remote_resource_links_for_host("devbox")?.len(), 1);
+
+        let mut operation = ForwardedOperation::pending(
+            "op_create",
+            "devbox",
+            "create_session",
+            json!({ "description": "remote" }),
+        );
+        store.upsert_forwarded_operation(&operation)?;
+        operation.status = ForwardedOperationStatus::Applied;
+        operation.local_resource_uri = Some(link.local_resource_uri.clone());
+        operation.result = Some(json!({ "remote_session_id": "sess_remote" }));
+        operation.updated_at = now_rfc3339();
+        store.upsert_forwarded_operation(&operation)?;
+        let stored_operation = store
+            .get_forwarded_operation("op_create")?
+            .ok_or_else(|| SingletonError::Store("forwarded operation missing".to_string()))?;
+        assert_eq!(stored_operation.status, ForwardedOperationStatus::Applied);
+        assert!(
+            store
+                .pending_forwarded_operations_for_host("devbox")?
+                .is_empty()
+        );
         Ok(())
     }
 }
