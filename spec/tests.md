@@ -230,26 +230,20 @@ cargo test --workspace --features live-copilot -- --ignored
   - **Invariants**: Worktree creation uses the requested repo/ref/branch/path;
     cleanup can be retried safely.
 
-- **H3. SSH worktree operations use deterministic remote commands**
-  - **Status**: Enforced.
-  - **Executable anchors**: `ssh_connector_builds_remote_worktree_commands`.
-  - **Preconditions**: Use an SSH connector with a recording runner and a git
-    worktree spec for repo `/srv/repo`, branch `feature-x`, base `main`, and
-    path `/srv/worktrees/feature-x`.
-  - **Postconditions**: Exactly two commands are recorded: quoted worktree add
-    and forced worktree remove.
-  - **Invariants**: Remote workspace lifecycle commands are deterministic and
-    quote all paths/refs before execution.
+- **H3. SSH hosts are remote singleton endpoints, not shell worktree runners**
+  - **Status**: Planned.
+  - **Executable anchors**: none.
+  - **Preconditions**: Configure an SSH host descriptor and attempt to place a
+    workspace/session there before the remote singleton federation path is
+    enabled.
+  - **Postconditions**: Capabilities do not advertise remote workspace providers
+    or agent backends from config alone; remote placement returns a typed
+    unsupported/unavailable error instead of running ad hoc SSH/git commands.
+  - **Invariants**: SSH support must route workspace/session lifecycle through a
+    remote singleton control surface and must not use local remote-shell
+    worktree commands as the product implementation.
 
-- **H4. Shell quoting preserves single quotes**
-  - **Status**: Enforced.
-  - **Executable anchors**: `shell_quote_handles_single_quotes`.
-  - **Preconditions**: Quote the string `a'b`.
-  - **Postconditions**: The result is `'a'"'"'b'`.
-  - **Invariants**: Shell quoting must produce a single shell token that
-    preserves embedded single quotes.
-
-- **H5. Planned host/workspace invariants**
+- **H4. Planned host/workspace invariants**
   - **Status**: Planned.
   - **Executable anchors**: none for the exact cases below.
   - **Preconditions**: Exercise branch/base-ref metadata, `keep`,
