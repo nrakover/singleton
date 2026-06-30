@@ -240,6 +240,7 @@ mod tests {
                 model: None,
                 mode: None,
                 labels: Vec::new(),
+                operation_id: None,
             }))
             .await
             .map_err(SingletonError::InvalidInput)?;
@@ -248,6 +249,7 @@ mod tests {
                 session_id: created.session_id.clone(),
                 message: "hello".to_string(),
                 mode: None,
+                operation_id: None,
             }))
             .await
             .map_err(SingletonError::InvalidInput)?;

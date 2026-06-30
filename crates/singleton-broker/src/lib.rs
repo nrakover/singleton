@@ -13,7 +13,7 @@ use singleton_core::{
     Result, Session, SingletonError, Turn, TurnId, Workspace, WorkspaceSpec,
     backend_payload_summary, resource_uri,
 };
-use singleton_core::{HostConnector, compact_json};
+use singleton_core::{HostConnector, ReadSyncStatus, compact_json};
 use singleton_store::{Store, new_request, new_session, new_turn};
 
 pub struct Broker<B, H>
@@ -273,6 +273,7 @@ where
                     events,
                     next_cursor,
                     timed_out: wait_ms > 0 && Instant::now() >= deadline,
+                    sync_status: None,
                 });
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -957,6 +958,7 @@ fn no_turn_latest_output(session: &Session) -> LatestOutput {
         inspection_hint: Some(
             "no completed, failed, or cancelled turn exists for this session".to_string(),
         ),
+        sync_status: None,
     }
 }
 
@@ -978,6 +980,7 @@ fn latest_output_from_events(session: &Session, turn: &Turn, events: &[Event]) -
             result_source: output.source,
             needs_event_inspection: false,
             inspection_hint: None,
+            sync_status: None,
         };
     }
 
@@ -996,6 +999,7 @@ fn latest_output_from_events(session: &Session, turn: &Turn, events: &[Event]) -
             events.len(),
             turn.resource_uri
         )),
+        sync_status: None,
     }
 }
 
@@ -1103,6 +1107,8 @@ pub struct CreateSessionRequest {
     pub mode: Option<String>,
     #[serde(default)]
     pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1119,6 +1125,8 @@ pub struct SendMessageRequest {
     pub session_id: String,
     pub message: String,
     pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1145,6 +1153,8 @@ pub struct ReadEventsReply {
     pub events: Vec<Event>,
     pub next_cursor: i64,
     pub timed_out: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_status: Option<ReadSyncStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1167,6 +1177,8 @@ pub struct ResolveRequest {
     pub decision: RequestDecision,
     pub response: Option<Value>,
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
@@ -1186,6 +1198,8 @@ pub struct AckInboxReply {
 pub struct CancelTurnRequest {
     pub session_id: String,
     pub turn_id: Option<TurnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1207,6 +1221,8 @@ pub struct CloseResourceRequest {
     pub disposition: Option<CloseDisposition>,
     #[serde(default)]
     pub force: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1288,6 +1304,7 @@ mod tests {
                 model: None,
                 mode: None,
                 labels: vec!["test".to_string()],
+                operation_id: None,
             })
             .await?;
         let sent = broker
@@ -1295,6 +1312,7 @@ mod tests {
                 session_id: created.session_id.clone(),
                 message: "hello".to_string(),
                 mode: None,
+                operation_id: None,
             })
             .await?;
 
@@ -1335,6 +1353,7 @@ mod tests {
                 session_id: created.session_id.clone(),
                 message: "finish".to_string(),
                 mode: None,
+                operation_id: None,
             })
             .await?;
         broker
@@ -1383,6 +1402,7 @@ mod tests {
                 session_id: created.session_id.clone(),
                 message: "fail".to_string(),
                 mode: None,
+                operation_id: None,
             })
             .await?;
         broker
@@ -1424,6 +1444,7 @@ mod tests {
                 session_id: created.session_id.clone(),
                 message: "finish quietly".to_string(),
                 mode: None,
+                operation_id: None,
             })
             .await?;
         broker
@@ -1499,6 +1520,7 @@ mod tests {
                 model: None,
                 mode: None,
                 labels: Vec::new(),
+                operation_id: None,
             })
             .await?;
         broker
@@ -1506,6 +1528,7 @@ mod tests {
                 session_id: created.session_id,
                 message: "run command".to_string(),
                 mode: None,
+                operation_id: None,
             })
             .await?;
         broker
@@ -1533,6 +1556,7 @@ mod tests {
             decision: RequestDecision::Approve,
             response: Some(json!({ "scope": "once" })),
             reason: None,
+            operation_id: None,
         })?;
         assert_eq!(resolved.status, singleton_core::RequestStatus::Resolved);
         Ok(())
@@ -1560,6 +1584,7 @@ mod tests {
                 model: None,
                 mode: None,
                 labels: Vec::new(),
+                operation_id: None,
             })
             .await?;
 
@@ -1572,6 +1597,7 @@ mod tests {
                 },
                 disposition: Some(CloseDisposition::Delete),
                 force: false,
+                operation_id: None,
             })
             .await;
         assert!(err.is_err());
@@ -1594,6 +1620,7 @@ mod tests {
                 model: None,
                 mode: None,
                 labels: Vec::new(),
+                operation_id: None,
             })
             .await?;
         let detail = broker.get_session(&created.session_id)?;
@@ -1647,6 +1674,7 @@ mod tests {
                 model: None,
                 mode: None,
                 labels: Vec::new(),
+                operation_id: None,
             })
             .await?;
         let sent = broker
@@ -1654,6 +1682,7 @@ mod tests {
                 session_id: created.session_id,
                 message: "finish".to_string(),
                 mode: None,
+                operation_id: None,
             })
             .await?;
         broker
@@ -1696,6 +1725,7 @@ mod tests {
                 model: None,
                 mode: None,
                 labels: Vec::new(),
+                operation_id: None,
             })
             .await?;
         let sent = broker
@@ -1703,6 +1733,7 @@ mod tests {
                 session_id: created.session_id.clone(),
                 message: "needs permission".to_string(),
                 mode: None,
+                operation_id: None,
             })
             .await?;
         broker
@@ -1721,6 +1752,7 @@ mod tests {
             .cancel_turn(CancelTurnRequest {
                 session_id: created.session_id,
                 turn_id: Some(sent.turn_id),
+                operation_id: None,
             })
             .await?;
 
@@ -1779,6 +1811,7 @@ mod tests {
                 model: None,
                 mode: None,
                 labels: Vec::new(),
+                operation_id: None,
             })
             .await
     }

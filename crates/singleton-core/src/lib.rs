@@ -18,6 +18,7 @@ pub type EventId = String;
 pub type BackendId = String;
 pub type BackendSessionId = String;
 pub type BackendTurnId = String;
+pub type OperationId = String;
 
 pub const LOCAL_HOST_ID: &str = "host_local";
 pub const COPILOT_BACKEND_ID: &str = "copilot";
@@ -184,6 +185,137 @@ pub enum ResourceStatus {
     Disposed,
     Deleted,
     Degraded,
+    NotChecked,
+    Checking,
+    Unavailable,
+    Incompatible,
+    Backoff,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HostConnectionState {
+    Configured,
+    NotChecked,
+    Unsupported,
+    Connecting,
+    Handshaking,
+    Available,
+    Idle,
+    Unavailable,
+    Incompatible,
+    Degraded,
+    Backoff,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RemoteBrokerIdentity {
+    pub broker_id: String,
+    pub protocol_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RemoteHostHealth {
+    pub host_id: HostId,
+    pub state: HostConnectionState,
+    pub remote_identity: Option<RemoteBrokerIdentity>,
+    pub capabilities: Option<Capabilities>,
+    pub last_checked_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub last_error: Option<String>,
+    pub updated_at: String,
+}
+
+impl RemoteHostHealth {
+    pub fn not_checked(host_id: impl Into<String>) -> Self {
+        Self {
+            host_id: host_id.into(),
+            state: HostConnectionState::NotChecked,
+            remote_identity: None,
+            capabilities: None,
+            last_checked_at: None,
+            last_success_at: None,
+            last_error: None,
+            updated_at: now_rfc3339(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardedOperationStatus {
+    Pending,
+    Applied,
+    Failed,
+    Uncertain,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ForwardedOperation {
+    pub operation_id: OperationId,
+    pub host_id: HostId,
+    pub operation_kind: String,
+    pub status: ForwardedOperationStatus,
+    pub local_resource_uri: Option<String>,
+    pub request: Value,
+    pub result: Option<Value>,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl ForwardedOperation {
+    pub fn pending(
+        operation_id: impl Into<String>,
+        host_id: impl Into<String>,
+        operation_kind: impl Into<String>,
+        request: Value,
+    ) -> Self {
+        let now = now_rfc3339();
+        Self {
+            operation_id: operation_id.into(),
+            host_id: host_id.into(),
+            operation_kind: operation_kind.into(),
+            status: ForwardedOperationStatus::Pending,
+            local_resource_uri: None,
+            request,
+            result: None,
+            error: None,
+            created_at: now.clone(),
+            updated_at: now,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RemoteResourceLink {
+    pub local_resource_uri: String,
+    pub local_resource_kind: ResourceKind,
+    pub local_id: String,
+    pub host_id: HostId,
+    pub remote_resource_uri: String,
+    pub remote_id: String,
+    pub remote_cursor: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadFreshness {
+    Fresh,
+    Cached,
+    Refreshing,
+    StaleUnavailable,
+    StaleReconcileFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReadSyncStatus {
+    pub freshness: ReadFreshness,
+    pub host_id: Option<HostId>,
+    pub checked_at: Option<String>,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -352,6 +484,8 @@ pub struct LatestOutput {
     pub result_source: LatestOutputSource,
     pub needs_event_inspection: bool,
     pub inspection_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_status: Option<ReadSyncStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

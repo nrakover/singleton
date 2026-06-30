@@ -196,7 +196,21 @@ cargo test --workspace --features live-copilot -- --ignored
   - **Invariants**: Resolved requests are no longer actionable pending work and
     remain readable through stored state.
 
-- **S5. Planned store invariants**
+- **S5. Remote federation state is durable and idempotency-aware**
+  - **Status**: Enforced.
+  - **Executable anchors**: `remote_federation_state_roundtrips`.
+  - **Preconditions**: Persist SSH/remote host health, a local-to-remote session
+    resource link with a remote event cursor, and a forwarded operation that is
+    first pending and later applied.
+  - **Postconditions**: Host health reads back with the connection state;
+    resource links read back by local URI and host, cursor updates are durable,
+    and an applied forwarded operation is not returned as pending retry work.
+  - **Invariants**: Local resource ids, remote resource ids, host ids, remote
+    cursors, operation ids, request payloads, results, and retry status remain
+    distinct and durable so reconnect can retry or reconcile without duplicating
+    remote work.
+
+- **S6. Planned store invariants**
   - **Status**: Planned.
   - **Executable anchors**: none.
   - **Preconditions**: Persist singleton intents, event filters, request
