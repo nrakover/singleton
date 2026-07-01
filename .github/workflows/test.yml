@@ -1,0 +1,37 @@
+name: Test
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install 1.94.0 --profile minimal --component rustfmt --component clippy
+
+      - name: Check shell scripts
+        run: bash -n scripts/install.sh .github/plugin/bin/singleton-mcp
+
+      - name: Check formatting
+        run: cargo +1.94.0 fmt --all --check
+
+      - name: Run clippy
+        run: cargo +1.94.0 clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo +1.94.0 test --workspace --all-targets
+
+      - name: Check whitespace
+        run: git --no-pager diff --check
