@@ -25,6 +25,7 @@ The `singleton` binary exposes these public commands:
 | `stop` | Stop the daemon and idempotently clean stale pid/socket files. |
 | `mcp-config` | Print a JSON MCP server snippet for manual client configuration. |
 | `install-mcp` | Register singleton with a supported MCP client using that client's native command. |
+| `update` | Update the installed singleton binary from GitHub Release assets. |
 
 Global configuration inputs:
 
@@ -57,6 +58,25 @@ codex mcp add NAME -- BINARY serve --stdio --backend BACKEND
 
 When `--database PATH` is provided, append `--database PATH` to the MCP server
 command after the backend arguments.
+
+`update` inputs:
+
+| Option | Values/default | Purpose |
+|---|---|---|
+| `--version` | latest release | Download a specific release tag such as `v0.1.0`. |
+| `--install-dir` | current executable directory | Replace `PATH/singleton` instead of the running executable. |
+| `--release-base-url` | GitHub Releases latest/version URL | Download assets from a custom base URL. |
+| `--dry-run` | false | Print the resolved platform, archive URL, checksum URL, and target path without downloading. |
+| `--force` | false | Reinstall even when the target version already matches the candidate. |
+
+`update` uses the same release archive names and `.sha256` files as the public
+installer. It must verify the checksum before extraction, validate the candidate
+binary with `--version`, refuse unsupported OS/architecture combinations, and
+replace the target through a same-directory temporary file plus rename so failed
+downloads or checksum mismatches leave the existing binary untouched. It must not
+invoke `sudo`, edit shell startup files, or register MCP clients. If a daemon is
+already running after a successful replacement, the CLI reports that the daemon
+must be stopped/restarted before it uses the updated executable.
 
 ---
 

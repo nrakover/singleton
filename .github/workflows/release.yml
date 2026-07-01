@@ -25,6 +25,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Check shell scripts
+        run: bash -n scripts/install.sh .github/plugin/bin/singleton-mcp
+
       - name: Install Rust
         run: |
           rustup toolchain install 1.94.0 --profile minimal
@@ -58,11 +61,19 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+
+      - name: Add installer asset
+        run: |
+          bash -n scripts/install.sh .github/plugin/bin/singleton-mcp
+          cp scripts/install.sh dist/install.sh
 
       - name: Publish release
         env:

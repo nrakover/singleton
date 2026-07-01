@@ -674,14 +674,31 @@ cargo test -p singleton-remote --features live-ssh -- --ignored
   - **Invariants**: Ordinary status is a cached administrative view and must not
     hang on SSH authentication or network availability.
 
-- **L14. Planned CLI invariants**
+- **L14. Update command release planning and safe replacement**
+  - **Status**: Enforced.
+  - **Executable anchors**: `maps_supported_targets`,
+    `builds_latest_release_plan`, `builds_versioned_release_plan`,
+    `custom_release_base_url_wins`, `parses_version_output`,
+    `reads_executable_version`, `installs_candidate_atomically`.
+  - **Preconditions**: Resolve supported/unsupported platform triples, build
+    latest/versioned/custom release plans, parse candidate version output, and
+    install a candidate binary into a temporary target path.
+  - **Postconditions**: Release URLs use the existing archive/checksum naming
+    convention; unsupported platforms fail; candidate versions are parsed from
+    `--version`; replacement writes an executable target through a temporary
+    file.
+  - **Invariants**: `singleton update` must verify and install the exact release
+    asset selected by platform/version/base URL, and failed preparation must
+    leave the existing target binary untouched.
+
+- **L15. Planned CLI invariants**
   - **Status**: Planned.
   - **Executable anchors**: none for the exact cases below.
   - **Preconditions**: Exercise `singleton serve --backend copilot` backend
     selection without live credentials, stdio proxy-to-daemon disconnect
     behavior, `singleton status` state summaries beyond daemon status,
-    `singleton mcp-config --backend copilot`, and broader human-readable output
-    snapshots.
+    `singleton mcp-config --backend copilot`, `singleton update --dry-run`, and
+    broader human-readable output snapshots.
   - **Postconditions**: CLI output remains stable for smoke tests; proxy
     disconnect does not stop broker-owned turns; generated MCP config is
     structurally correct.
@@ -813,17 +830,33 @@ unless explicitly marked live.
     supported macOS/Linux targets, release archives, marketplace manifest,
     plugin manifest, Skill frontmatter, MCP config, launcher script, and local
     Copilot plugin install.
-  - **Postconditions**: Release publishes `.tar.gz` archives and `.sha256`
-    files for `v*.*.*` tags; archives contain an executable `singleton`; plugin
-    manifests point to the plugin subdirectory, MCP config, and skills
-    directory; `skills/singleton/SKILL.md` has valid frontmatter; launcher starts
-    through `bash`, passes shell syntax checks, writes bootstrap diagnostics to
-    stderr, and honors `SINGLETON_BINARY`, `SINGLETON_VERSION`,
-    `SINGLETON_RELEASE_BASE_URL`, `SINGLETON_FORCE_INSTALL`,
-    `SINGLETON_BACKEND`, and `SINGLETON_DATABASE`.
+  - **Postconditions**: Release publishes `.tar.gz` archives, `.sha256` files,
+    and `install.sh` for `v*.*.*` tags; archives contain an executable
+    `singleton`; plugin manifests point to the plugin subdirectory, MCP config,
+    and skills directory; `skills/singleton/SKILL.md` has valid frontmatter;
+    installer and launcher scripts pass shell syntax checks; launcher starts
+    through `bash`, writes bootstrap diagnostics to stderr, and honors
+    `SINGLETON_BINARY`, `SINGLETON_VERSION`, `SINGLETON_RELEASE_BASE_URL`,
+    `SINGLETON_FORCE_INSTALL`, `SINGLETON_BACKEND`, `SINGLETON_DATABASE`,
+    `SINGLETON_CONFIG`, `SINGLETON_PROFILE`, and
+    `SINGLETON_NO_PROJECT_CONFIG`.
   - **Invariants**: Packaging tests must not download release assets in the
     default unit gate. Networked release/download checks belong in release or
     manual smoke validation.
+
+- **G2. Public installer safety**
+  - **Status**: Planned for release/manual smoke; partially enforced by
+    `bash -n scripts/install.sh`.
+  - **Executable anchors**: release workflow shell syntax check.
+  - **Preconditions**: Run `scripts/install.sh --dry-run`, a pinned-version fake
+    release install, and failure cases for unsupported platform, checksum
+    mismatch, missing tools, and unwritable target directory.
+  - **Postconditions**: The installer resolves the same archive/checksum names as
+    `singleton update`, verifies checksums before extraction, installs into the
+    requested user-writable directory, and prints PATH/MCP next steps without
+    editing shell startup files or client config.
+  - **Invariants**: `curl | bash` installation must stay binary-only, checksum
+    verified, non-escalating, and explicit about unsupported platforms.
 
 ---
 

@@ -49,11 +49,33 @@ warns that direct installs are deprecated. Prefer the marketplace flow above.
 
 ## Direct binary installation
 
-Rust users can install from source:
+The preferred direct binary installer is hosted as a GitHub Release asset:
 
 ```bash
-cargo install --locked --git https://github.com/nrakover/singleton --bin singleton
+curl -fsSL https://github.com/nrakover/singleton/releases/latest/download/install.sh | bash
 ```
+
+It supports macOS Apple Silicon and Linux x86_64, downloads the matching release
+archive plus `.sha256` file, verifies the checksum, and installs
+`singleton` into `$HOME/.local/bin` by default. It never invokes `sudo` or edits
+shell startup files.
+
+Installer options can be passed with `bash -s --`:
+
+```bash
+curl -fsSL https://github.com/nrakover/singleton/releases/latest/download/install.sh \
+  | bash -s -- --version v0.1.0 --install-dir "$HOME/.local/bin"
+```
+
+Supported installer controls:
+
+| Option/env | Purpose |
+|---|---|
+| `--version VERSION` / `SINGLETON_VERSION` | Install a specific tag such as `v0.1.0`. |
+| `--install-dir PATH` / `SINGLETON_INSTALL_DIR` | Install directory; defaults to `$HOME/.local/bin`. |
+| `--release-base-url URL` / `SINGLETON_RELEASE_BASE_URL` | Download archives from a custom base URL. |
+| `--force` / `SINGLETON_FORCE_INSTALL=1` | Reinstall even if the target version is already installed. |
+| `--dry-run` | Print the resolved platform, URLs, and target path without downloading. |
 
 Tagged releases publish prebuilt archives named:
 
@@ -63,6 +85,38 @@ singleton-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 Each archive has a matching `.sha256` file.
+
+Rust users can also install from source:
+
+```bash
+cargo install --locked --git https://github.com/nrakover/singleton --bin singleton
+```
+
+## Updating the binary
+
+Use `singleton update` to update an existing direct binary installation from
+GitHub Releases:
+
+```bash
+singleton update
+singleton update --version v0.1.0
+singleton update --dry-run
+singleton update --install-dir "$HOME/.local/bin"
+```
+
+`singleton update` uses the same archive names and checksum files as the
+installer. By default it updates the currently running `singleton` executable;
+`--install-dir` targets `PATH/singleton` instead. The command downloads into a
+temporary directory, verifies the checksum before extraction, validates the
+candidate binary with `--version`, skips replacement when the installed version
+is already current unless `--force` is set, then replaces the target binary via
+a same-directory temporary file and rename.
+
+The command does not escalate privileges. If the target is not writable, choose a
+user-writable install directory or rerun the installer with an explicit
+`--install-dir`. Updating the binary does not restart an already-running
+`singletond`; stop it with `singleton stop` when you want the next daemon start
+to use the new binary.
 
 ## Registering MCP clients
 
