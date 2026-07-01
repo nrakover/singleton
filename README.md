@@ -19,25 +19,17 @@ There are two pieces to install:
 
 ### 1. Install the binary
 
-Download the latest archive for your platform from
-<https://github.com/nrakover/singleton/releases/latest>.
-
-Current prebuilt archives:
-
-- `singleton-aarch64-apple-darwin.tar.gz` for macOS Apple Silicon
-- `singleton-x86_64-unknown-linux-gnu.tar.gz` for Linux x86_64
-
-Install it somewhere on your `PATH`, for example:
+Install the latest prebuilt binary:
 
 ```bash
-mkdir -p "$HOME/.local/bin"
-tar -xzf singleton-aarch64-apple-darwin.tar.gz
-install -m 0755 singleton-*/singleton "$HOME/.local/bin/singleton"
+curl -fsSL https://github.com/nrakover/singleton/releases/latest/download/install.sh | bash
 singleton status
 ```
 
-Use the Linux archive name instead on Linux. If `singleton` is not found after
-installation, add your local bin directory to your shell startup file:
+The installer supports macOS Apple Silicon and Linux x86_64, verifies the
+release checksum, and installs to `$HOME/.local/bin` by default. If `singleton`
+is not found after installation, add your local bin directory to your shell
+startup file:
 
 ```bash
 echo 'export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"' >> ~/.zshrc
@@ -45,6 +37,15 @@ exec zsh
 ```
 
 For bash, use `~/.bashrc` instead of `~/.zshrc`.
+
+To update the binary later:
+
+```bash
+singleton update
+```
+
+Manual release archives are also available from
+<https://github.com/nrakover/singleton/releases/latest>.
 
 If you prefer building from source:
 
@@ -81,6 +82,7 @@ Use the singleton skill. Create a background session that replies exactly
 singleton status              # show daemon state and known sessions
 singleton stop                # stop the local daemon and clean stale files
 singleton start               # start/reuse the daemon explicitly
+singleton update              # update the installed binary from GitHub Releases
 singleton mcp-config          # print a manual MCP config snippet
 ```
 

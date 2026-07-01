@@ -80,6 +80,24 @@ Supported launcher overrides include `SINGLETON_BINARY`,
 `SINGLETON_CONFIG`, `SINGLETON_PROFILE`, and
 `SINGLETON_NO_PROJECT_CONFIG`.
 
+Direct binary installation is supported through a GitHub Releases-hosted
+installer:
+
+```bash
+curl -fsSL https://github.com/nrakover/singleton/releases/latest/download/install.sh | bash
+```
+
+The installer must resolve the supported platform, download the matching release
+archive and `.sha256` asset, verify the checksum, install into a user-writable
+directory such as `$HOME/.local/bin`, and avoid `sudo`, shell profile edits, or
+MCP client registration by default. It must support pinned releases and custom
+install directories.
+
+`singleton update` is the native binary update command. It uses the same release
+archive/checksum naming as the installer, validates the downloaded candidate
+with `--version`, replaces the target binary atomically where possible, and tells
+users when a running daemon must be restarted before it uses the new executable.
+
 Direct CLI registration remains available for Copilot CLI, Claude Code, Codex,
 and other stdio MCP clients:
 

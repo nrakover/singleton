@@ -26,11 +26,14 @@ use singleton_test_support::FakeBackend;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 
+mod update;
+
 const DAEMON_STARTUP_LOCK_HELD_ENV: &str = "SINGLETON_DAEMON_STARTUP_LOCK_HELD";
 
 #[derive(Debug, Parser)]
 #[command(name = "singleton")]
 #[command(about = "Durable MCP broker for background agent sessions")]
+#[command(version)]
 struct Cli {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
@@ -91,6 +94,18 @@ enum Command {
         binary: Option<PathBuf>,
         #[arg(long)]
         dry_run: bool,
+    },
+    Update {
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long)]
+        install_dir: Option<PathBuf>,
+        #[arg(long)]
+        release_base_url: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -331,6 +346,23 @@ async fn main() -> Result<()> {
             binary,
             dry_run,
         ),
+        Command::Update {
+            version,
+            install_dir,
+            release_base_url,
+            dry_run,
+            force,
+        } => {
+            run_update_command(
+                &config_args,
+                version,
+                install_dir,
+                release_base_url,
+                dry_run,
+                force,
+            )
+            .await
+        }
     }
 }
 
@@ -533,6 +565,79 @@ fn install_mcp(
         client.command_name()
     );
     Ok(())
+}
+
+async fn run_update_command(
+    config_args: &ConfigArgs,
+    version: Option<String>,
+    install_dir: Option<PathBuf>,
+    release_base_url: Option<String>,
+    dry_run: bool,
+    force: bool,
+) -> Result<()> {
+    let outcome = update::run(update::UpdateOptions {
+        version,
+        install_dir,
+        release_base_url,
+        dry_run,
+        force,
+    })?;
+    match outcome {
+        update::UpdateOutcome::DryRun(plan) => {
+            println!("target: {}", plan.target.display());
+            println!("platform: {}", plan.target_triple);
+            println!("archive: {}", plan.archive_url);
+            println!("checksum: {}", plan.checksum_url);
+        }
+        update::UpdateOutcome::UpToDate { target, version } => {
+            println!(
+                "singleton already up to date: version {version} at {}",
+                target.display()
+            );
+        }
+        update::UpdateOutcome::Updated {
+            target,
+            previous_version,
+            version,
+        } => {
+            let previous = previous_version.unwrap_or_else(|| "not installed".to_string());
+            println!(
+                "updated singleton: {previous} -> {version} at {}",
+                target.display()
+            );
+            warn_if_daemon_running(config_args).await;
+        }
+    }
+    Ok(())
+}
+
+async fn warn_if_daemon_running(config_args: &ConfigArgs) {
+    let effective = match resolve_effective_config(config_args, None, None) {
+        Ok(effective) => effective,
+        Err(error) => {
+            eprintln!("warning: could not inspect singleton daemon after update: {error}");
+            return;
+        }
+    };
+    let paths = match resolve_state_paths(effective.database) {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("warning: could not inspect singleton daemon after update: {error}");
+            return;
+        }
+    };
+    match inspect_daemon(&paths).await {
+        Ok(daemon) if daemon.state == DaemonState::Running => {
+            println!(
+                "note: singletond is running; stop it with '{}' so the next start uses the updated binary",
+                cleanup_command(&paths.database)
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("warning: could not inspect singleton daemon after update: {error}");
+        }
+    }
 }
 
 fn resolve_effective_config(

@@ -39,7 +39,46 @@ Copilot stores MCP configuration.
 
 ---
 
-## 0.1 Direct MCP Client Registration
+## 0.1 Direct Binary Install and Update
+
+### Goal
+
+Install or update the native `singleton` binary without requiring Rust or manual
+release archive extraction.
+
+### Flow
+
+1. User runs
+   `curl -fsSL https://github.com/nrakover/singleton/releases/latest/download/install.sh | bash`.
+2. The installer resolves the local OS/architecture to a supported release
+   target.
+3. The installer downloads `singleton-<target>.tar.gz` plus its matching
+   `.sha256` file from GitHub Releases.
+4. The installer verifies the checksum, extracts the archive, and installs
+   `singleton` into `$HOME/.local/bin` or the requested `--install-dir`.
+5. The installer prints PATH guidance if the target directory is not currently
+   on PATH and points the user at `singleton install-mcp --client copilot`.
+6. Later, the user runs `singleton update`.
+7. `singleton update` downloads and verifies the matching release asset, compares
+   the candidate version with the target binary, and replaces the target through
+   a same-directory temporary file and rename.
+
+### Expected behavior
+
+- Users can pin a binary install or update with `--version vX.Y.Z`.
+- Users can choose a user-writable target directory with `--install-dir`.
+- `--dry-run` shows the selected platform, archive URL, checksum URL, and target
+  path without downloading or replacing anything.
+- Checksum mismatch, unsupported platforms, missing `curl`/`tar`/checksum tools,
+  and unwritable install paths fail explicitly.
+- Neither the installer nor `singleton update` invokes `sudo`, edits shell
+  startup files, or registers MCP clients by default.
+- Updating the binary does not restart a running daemon; singleton tells the
+  user to stop/restart the daemon when a running daemon is detected.
+
+---
+
+## 0.2 Direct MCP Client Registration
 
 ### Goal
 
@@ -65,7 +104,7 @@ Configure a foreground agent client after `singleton` is already installed.
 
 ---
 
-## 0.2 Configure Singleton Defaults
+## 0.3 Configure Singleton Defaults
 
 ### Goal
 

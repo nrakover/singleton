@@ -66,12 +66,15 @@ Remaining MCP and daemon usability follow-ups:
 
 - Publish `singleton-cli` to crates.io once the binary name/package layout is
   stable enough for `cargo install singleton`.
+- Keep the GitHub Releases installer and `singleton update` command aligned on
+  supported platforms, archive names, checksum verification, and update-channel
+  policy.
 - Add Homebrew distribution for macOS users who do not want to use Cargo or the
   Copilot plugin bootstrapper.
 - Add Windows release artifacts and plugin launcher support after the daemon
   transport story has a Windows equivalent to Unix sockets.
-- Decide whether to add `singleton self-update` or keep updates delegated to
-  Copilot plugin updates, Homebrew, Cargo, and GitHub Releases.
+- Decide whether `singleton update` should support named channels beyond latest
+  and pinned release tags.
 
 ## Foreground-agent hub convention
 
